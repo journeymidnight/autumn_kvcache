@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autumn-kvcache"
+version = "0.1.0"
+description = "sglang HiCache L3 storage backend on top of autumn-rs partition layer"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "autumn-rs contributors" }]
+dependencies = [
+  # The autumn PyO3 extension. Install via `cd python && maturin develop`
+  # or `pip install autumn` once published. We intentionally do NOT declare
+  # a hard version pin here — autumn-kvcache tracks whatever local autumn
+  # build is on PYTHONPATH.
+  # "autumn",
+]
+
+[project.optional-dependencies]
+sglang = []  # sglang itself is not a hard dep; this is just a marker.
+
+[tool.setuptools.packages.find]
+include = ["autumn_kvcache*"]
+exclude = ["tests*"]
