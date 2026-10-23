@@ -233,7 +233,9 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 AUTUMN_KVCACHE_TRANSPORT=tcp \
   that `set_from_flat_data_page` puts into the pool. Stored bytes follow the
   pool's own order, so every layout but `layer_first` carries its name in the
   key: instances with different layouts never read each other's pages. For the
-  copy-free path, run sglang with `--hicache-mem-layout page_first_direct`.
+  copy-free path, run sglang with `--hicache-mem-layout page_first_direct`; the
+  copy path keeps a scratch buffer the size of one batch (128 pages) on each of
+  sglang's backup and prefetch threads.
   These layouts need the v1 interface (`"interface_v1": 1`); the v0 wrappers
   use the untagged key.
 - **No duplicate writes** — a page already stored (all of its values present)

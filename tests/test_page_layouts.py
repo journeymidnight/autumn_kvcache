@@ -252,3 +252,34 @@ def test_v2_transfers_land_in_the_named_pool():
     assert all(reader._batch_v2([t], reader._get_pages, "get")["kv"])
     for s in STARTS:
         assert torch.equal(page_bytes(dst, s), page_bytes(src, s))
+
+
+@pytest.mark.parametrize("make,kind", POOLS)
+def test_a_batch_calls_no_get_data_page_per_page(make, kind):
+    """Once the pool is classified, a batch takes its buffers from numpy
+    slices: no per-page torch calls, each of which retakes the GIL behind
+    sglang's busy scheduler thread."""
+    store, pool = FakeStore(), make()
+    fill(pool, 6)
+    b = backend(store, pool)
+    b._codec(pool)
+    calls = []
+    real = pool.get_data_page
+    pool.get_data_page = lambda *a, **k: calls.append(a) or real(*a, **k)
+    b.batch_set_v1(HASHES, indices(STARTS))
+    store.data = dict(store.data)
+    b.batch_get_v1(HASHES, indices(STARTS))
+    if isinstance(pool, CatPool):
+        assert calls, "a pool that assembles its pages has no page axis"
+    else:
+        assert calls == [], f"{len(calls)} per-page get_data_page calls"
+
+
+@pytest.mark.parametrize("start", [P // 2, 10_000 * P])
+def test_a_host_index_off_the_pool_fails_the_batch(start):
+    store, pool = FakeStore(), MHAPool("layer_first")
+    fill(pool, 7)
+    b = backend(store, pool)
+    assert b.batch_set_v1(HASHES[:1], indices([0])) == [True]
+    assert b.batch_get_v1(HASHES[:1], indices([start])) == [False]
+    assert b._stats["get_error"] == 1

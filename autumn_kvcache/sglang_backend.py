@@ -197,10 +197,13 @@ class _PageCodec:
     it directly. `halves`: the page is not, but its two halves (K and V) are,
     as in `page_first` / `page_first_direct` — one value each, directly.
     `copy`: neither (`layer_first`, Mamba) — the page is copied out to write,
-    and a read lands in a scratch buffer that `set_from_flat_data_page` puts
-    into the pool. Receiving into `get_data_page(flat=True)` instead, as this
-    backend used to, fills a copy and leaves the pool untouched while the
-    read reports a hit.
+    and a read lands in a scratch buffer that is then put into the pool.
+    Receiving into `get_data_page(flat=True)` instead, as this backend used
+    to, fills a copy and leaves the pool untouched while the read reports a
+    hit.
+
+    With a page axis (`_page_axis`), a host index must start a page; one that
+    does not fails its batch.
 
     The stored bytes are in the pool's own order, which differs per layout, so
     every layout but the default carries its name in the key: instances with
@@ -223,21 +226,112 @@ class _PageCodec:
             self.kind = self.COPY
             self.dtype = page.dtype
             self.nbytes = page.numel() * page.element_size()
+        self.page_size = getattr(pool, "page_size", None)
+        self.pages = _page_axis(pool, page, self.page_size)
+        if self.pages is not None:
+            import torch
+
+            self.pages_t = torch.from_numpy(self.pages)
 
     def keys(self, base: bytes) -> List[bytes]:
         if self.kind == self.HALVES:
             return [base + self.tag + b".k", base + self.tag + b".v"]
         return [base + self.tag]
 
-    def direct_buffers(self, pool, start: int):
-        """The page's bytes as views into the pool (`whole` / `halves`), or a
-        copy of them (`copy`, write side only)."""
-        if self.kind == self.COPY:
-            return [_as_bytes(pool.get_data_page(start, flat=True).contiguous())]
+    def segments(self, pool, start: int):
+        """`whole` / `halves`: the page's values as buffers that ARE the pool."""
+        if self.pages is not None:
+            page = self.pages[self._page_number(start)]
+            if self.kind == self.HALVES:
+                return [page[0].reshape(-1), page[1].reshape(-1)]
+            return [page.reshape(-1)]
         page = pool.get_data_page(start, flat=False)
         if self.kind == self.HALVES:
             return [_as_bytes(page[0]), _as_bytes(page[1])]
         return [_as_bytes(page)]
+
+    def copy_out(self, pool, starts, scratch):
+        """`copy`: each page's bytes; `scratch(nbytes)` gives the buffer."""
+        n = len(starts)
+        if self.pages is None:
+            return [_as_bytes(pool.get_data_page(s, flat=True).contiguous()) for s in starts]
+        import torch
+
+        buf = scratch(n * self.nbytes)
+        rows = buf[: n * self.nbytes].reshape((n,) + self.pages.shape[1:])
+        # One torch call into `rows`: numpy's gather goes through a batch-sized
+        # temporary (2 GiB: 0.5 s vs 0.8 s, one torch thread as sglang sets).
+        ks = torch.tensor([self._page_number(s) for s in starts])
+        torch.index_select(self.pages_t, 0, ks, out=torch.from_numpy(rows))
+        return [buf[i * self.nbytes:(i + 1) * self.nbytes] for i in range(n)]
+
+    def copy_in(self, pool, starts, scratch, ok):
+        """`copy`: puts the pages read into `scratch` into the pool."""
+        landed = [i for i, good in enumerate(ok) if good]
+        if not landed:
+            return
+        if self.pages is not None:
+            rows = scratch[: len(starts) * self.nbytes].reshape((len(starts),) + self.pages.shape[1:])
+            if len(landed) < len(starts):
+                rows = rows[landed]  # a copy, only when some page missed
+            # numpy's scatter: 0.32 s vs torch's 1.4 s for 2 GiB.
+            self.pages[[self._page_number(starts[i]) for i in landed]] = rows
+            return
+        import torch
+
+        for i in landed:
+            buf = scratch[i * self.nbytes:(i + 1) * self.nbytes]
+            pool.set_from_flat_data_page(starts[i], torch.from_numpy(buf).view(self.dtype))
+
+    def _page_number(self, start: int) -> int:
+        k, rest = divmod(start, self.page_size)
+        if rest or k >= len(self.pages):
+            raise ValueError(f"host index {start} is not a page of this pool")
+        return k
+
+
+def _page_axis(pool, page, page_size):
+    """The pool as one numpy array indexed by page number, when its pages are
+    same-shaped views of one storage at a fixed stride (every sglang KV pool;
+    not one that assembles a page, like Mamba); None otherwise. Its buffers
+    are numpy slices: no torch call per page, so no GIL retake per page behind
+    sglang's busy scheduler thread."""
+    if not _is_tensor(page) or not page_size:
+        return None
+    try:
+        probes = [page] + [pool.get_data_page(k * page_size, flat=False) for k in (1, 2)]
+    except Exception:  # noqa: BLE001 — a pool shorter than three pages
+        return None
+    storage = page.untyped_storage()
+    if any(p.untyped_storage().data_ptr() != storage.data_ptr()
+           or tuple(p.shape) != tuple(page.shape) or p.stride() != page.stride() for p in probes):
+        return None
+    es = page.element_size()
+    offs = [p.storage_offset() * es for p in probes]
+    step = offs[1] - offs[0]
+    if step <= 0 or offs[2] - offs[1] != step or any(st <= 0 for st in page.stride()):
+        return None
+    import torch
+
+    raw = torch.empty(0, dtype=torch.uint8).set_(storage, 0, (storage.nbytes(),), (1,)).numpy()
+    extent = sum((n - 1) * st for n, st in zip(page.shape, page.stride())) * es + es
+    count = (raw.size - offs[0] - extent) // step + 1
+    if getattr(pool, "size", None):
+        count = min(count, pool.size // page_size)  # the pool's pages, not its storage's
+    # In bytes, with every run of dimensions that is contiguous merged into
+    # one: a copy then moves long runs instead of one element at a time.
+    dims = [[n, st * es] for n, st in zip(page.shape, page.stride())] + [[es, 1]]
+    merged = [dims[-1]]
+    for n, st in reversed(dims[:-1]):
+        if st == merged[0][0] * merged[0][1]:
+            merged[0][0] *= n
+        else:
+            merged.insert(0, [n, st])
+    return np.lib.stride_tricks.as_strided(
+        raw[offs[0]:],
+        shape=(count, *(n for n, _ in merged)),
+        strides=(step, *(st for _, st in merged)),
+    )
 
 
 class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
@@ -377,11 +471,8 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     # ── lifecycle ──────────────────────────────────────────────────────────
 
     def register_mem_pool_host(self, mem_pool_host):
-        """Cache the pinned-host KV pool reference.
-
-        v1 batch_get/set use `mem_pool_host.get_data_page(idx, flat=True)` to
-        resolve `host_indices` into a buffer view per docs:174.
-        """
+        """Cache the pinned-host KV pool reference; pages move to and from
+        it through `_PageCodec`."""
         self._mem_pool_host = mem_pool_host
 
     def _full_key(self, hash_str: str, pool_name: str = DEFAULT_POOL_NAME) -> bytes:
@@ -424,11 +515,17 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self._stats["set_skipped"] = self._stats.get("set_skipped", 0) + len(base_keys) - len(todo)
         if todo:
             keys, bufs, owner = [], [], []
-            for i in todo:
-                segs = codec.direct_buffers(pool, starts[i])
-                keys += page_keys[i]
-                bufs += segs
-                owner += [i] * len(segs)
+            if codec.kind == _PageCodec.COPY:
+                bufs = codec.copy_out(pool, [starts[i] for i in todo], self._scratch)
+                for i in todo:
+                    keys += page_keys[i]
+                owner = list(todo)
+            else:
+                for i in todo:
+                    segs = codec.segments(pool, starts[i])
+                    keys += page_keys[i]
+                    bufs += segs
+                    owner += [i] * len(segs)
             ok = list(self._batch.put_from(keys, bufs, self._ttl_secs))
             for i in todo:
                 stored[i] = True
@@ -444,15 +541,11 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             scratch = self._scratch(len(starts) * codec.nbytes)
             bufs = [scratch[i * codec.nbytes:(i + 1) * codec.nbytes] for i in range(len(starts))]
             ok = list(self._batch.get_into([ks[0] for ks in page_keys], bufs))
-            import torch
-
-            for i, good in enumerate(ok):
-                if good:
-                    pool.set_from_flat_data_page(starts[i], torch.from_numpy(bufs[i]).view(codec.dtype))
+            codec.copy_in(pool, starts, scratch, ok)
             return ok
         keys, bufs, owner = [], [], []
         for i, start in enumerate(starts):
-            segs = codec.direct_buffers(pool, start)
+            segs = codec.segments(pool, start)
             keys += page_keys[i]
             bufs += segs
             owner += [i] * len(segs)
