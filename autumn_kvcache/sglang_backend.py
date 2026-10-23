@@ -21,7 +21,10 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
+import threading
 from typing import List, Optional
+
+import numpy as np
 
 import autumn
 
@@ -166,6 +169,77 @@ def _page_start_indices(keys, host_indices) -> List[int]:
     return [indices[i * page_size] for i in range(n)]
 
 
+def _is_tensor(x) -> bool:
+    return hasattr(x, "untyped_storage") and hasattr(x, "is_contiguous")
+
+
+def _pool_window(t) -> bool:
+    """`t` is a contiguous window into a larger buffer — the pool — so bytes
+    written through it land in the pool. A page that `flatten()` had to copy,
+    or that a pool assembles with `torch.cat` (Mamba), is contiguous too but
+    owns its storage: writing into it changes nothing the engine reads."""
+    return t.is_contiguous() and t.untyped_storage().nbytes() > t.numel() * t.element_size()
+
+
+def _as_bytes(page):
+    """A 1-D uint8 view of a contiguous page, for put_from / get_into."""
+    if _is_tensor(page):
+        import torch
+
+        return page.view(torch.uint8).numpy().reshape(-1)
+    return np.asarray(page).reshape(-1)
+
+
+class _PageCodec:
+    """How one host pool's pages map to stored values.
+
+    `whole`: the page is a window into the pool — sent from and received into
+    it directly. `halves`: the page is not, but its two halves (K and V) are,
+    as in `page_first` / `page_first_direct` — one value each, directly.
+    `copy`: neither (`layer_first`, Mamba) — the page is copied out to write,
+    and a read lands in a scratch buffer that `set_from_flat_data_page` puts
+    into the pool. Receiving into `get_data_page(flat=True)` instead, as this
+    backend used to, fills a copy and leaves the pool untouched while the
+    read reports a hit.
+
+    The stored bytes are in the pool's own order, which differs per layout, so
+    every layout but the default carries its name in the key: instances with
+    different layouts never read each other's pages. `layer_first` keeps the
+    keys written before.
+    """
+
+    WHOLE, HALVES, COPY = "whole", "halves", "copy"
+
+    def __init__(self, pool):
+        page = pool.get_data_page(0, flat=False)
+        layout = getattr(pool, "layout", None)
+        self.tag = b"" if layout in (None, "layer_first") else f".{layout}".encode()
+        if not _is_tensor(page) or _pool_window(page):
+            # Buffer-protocol pools (tests) hand out views already.
+            self.kind = self.WHOLE
+        elif page.dim() and page.shape[0] == 2 and _pool_window(page[0]) and _pool_window(page[1]):
+            self.kind = self.HALVES
+        else:
+            self.kind = self.COPY
+            self.dtype = page.dtype
+            self.nbytes = page.numel() * page.element_size()
+
+    def keys(self, base: bytes) -> List[bytes]:
+        if self.kind == self.HALVES:
+            return [base + self.tag + b".k", base + self.tag + b".v"]
+        return [base + self.tag]
+
+    def direct_buffers(self, pool, start: int):
+        """The page's bytes as views into the pool (`whole` / `halves`), or a
+        copy of them (`copy`, write side only)."""
+        if self.kind == self.COPY:
+            return [_as_bytes(pool.get_data_page(start, flat=True).contiguous())]
+        page = pool.get_data_page(start, flat=False)
+        if self.kind == self.HALVES:
+            return [_as_bytes(page[0]), _as_bytes(page[1])]
+        return [_as_bytes(page)]
+
+
 class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     """sglang HiCache L3 backend.
 
@@ -291,6 +365,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             "get_error": 0,
             "set_ok": 0,
             "set_error": 0,
+            "set_skipped": 0,
         }
         log.info(
             "AutumnKVCacheStorage connected: endpoint=%s model_scope=%s sglang=%s",
@@ -312,46 +387,90 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     def _full_key(self, hash_str: str, pool_name: str = DEFAULT_POOL_NAME) -> bytes:
         return full_key(self._model_scope, hash_str, pool_name)
 
-    def _page_view(self, idx: int):
-        """Resolve a host_index to a buffer-protocol view of the pinned page.
+    def _codec(self, pool) -> _PageCodec:
+        codecs = self.__dict__.setdefault("_codecs", {})
+        held = codecs.get(id(pool))
+        # The pool is kept with its codec: an id is reused once its object dies.
+        if held is None or held[0] is not pool:
+            held = codecs[id(pool)] = (pool, _PageCodec(pool))
+        return held[1]
 
-        sglang's HostKVCache.get_data_page(idx, flat=True) returns a 1-D
-        torch.Tensor view into the pinned host pool. Its dtype matches the
-        model's KV cache dtype (commonly bfloat16 or float16).
+    def _scratch(self, nbytes: int):
+        """A per-thread receive buffer for `copy` pages (prefetch and backup
+        run on different threads), grown on demand and reused."""
+        local = self.__dict__.setdefault("_scratch_local", threading.local())
+        buf = getattr(local, "buf", None)
+        if buf is None or buf.size < nbytes:
+            buf = local.buf = np.empty(nbytes, dtype=np.uint8)
+        return buf
 
-        autumn's `put_from` / `get_into` use PyBuffer<u8>, so we reinterpret
-        the tensor as uint8 before exposing it. `.view(torch.uint8)` is a
-        zero-copy bit-reinterpret on the same storage; `.numpy()` then yields
-        a numpy view of the same bytes (numpy has no native bfloat16 dtype,
-        so calling `.numpy()` directly on a bf16 tensor raises TypeError).
-        """
-        if self._mem_pool_host is None:
-            raise RuntimeError("register_mem_pool_host has not been called")
-        page = self._mem_pool_host.get_data_page(int(idx), flat=True)
-        # torch.Tensor branch: bf16/fp16/fp32 → uint8 byte view → numpy.
-        if hasattr(page, "view") and hasattr(page, "dtype") and hasattr(page, "numpy"):
-            try:
-                import torch  # lazy; available wherever sglang runs
-                return page.view(torch.uint8).numpy()
-            except ImportError:
-                # Fall through to direct .numpy() — works for already-uint8
-                # tensors (numpy/torch agree on uint8).
-                return page.numpy()
-        # numpy / memoryview / bytes already.
-        return page
+    def _present(self, page_keys) -> List[bool]:
+        """Per page: every value it is stored as exists."""
+        flat = [k for ks in page_keys for k in ks]
+        found = iter(run(lambda: self._client.batch_head(flat)))
+        return [all([next(found) for _ in ks]) for ks in page_keys]
 
-    # ── v1 zero-copy hot path ──────────────────────────────────────────────
+    def _put_pages(self, pool, base_keys, starts) -> List[bool]:
+        """Stores the pages not stored yet; True per page that is stored."""
+        codec = self._codec(pool)
+        page_keys = [codec.keys(k) for k in base_keys]
+        try:
+            stored = self._present(page_keys)
+        except Exception as e:  # noqa: BLE001
+            # The probe only saves work; without it, write everything.
+            log.debug("set dedup probe failed (n=%d): %r", len(base_keys), e)
+            stored = [False] * len(base_keys)
+        todo = [i for i, done in enumerate(stored) if not done]
+        self._stats["set_skipped"] = self._stats.get("set_skipped", 0) + len(base_keys) - len(todo)
+        if todo:
+            keys, bufs, owner = [], [], []
+            for i in todo:
+                segs = codec.direct_buffers(pool, starts[i])
+                keys += page_keys[i]
+                bufs += segs
+                owner += [i] * len(segs)
+            ok = list(self._batch.put_from(keys, bufs, self._ttl_secs))
+            for i in todo:
+                stored[i] = True
+            for i, good in zip(owner, ok):
+                stored[i] = stored[i] and good
+        return stored
+
+    def _get_pages(self, pool, base_keys, starts) -> List[bool]:
+        """Reads each page into the pool; True per page that landed there."""
+        codec = self._codec(pool)
+        page_keys = [codec.keys(k) for k in base_keys]
+        if codec.kind == _PageCodec.COPY:
+            scratch = self._scratch(len(starts) * codec.nbytes)
+            bufs = [scratch[i * codec.nbytes:(i + 1) * codec.nbytes] for i in range(len(starts))]
+            ok = list(self._batch.get_into([ks[0] for ks in page_keys], bufs))
+            import torch
+
+            for i, good in enumerate(ok):
+                if good:
+                    pool.set_from_flat_data_page(starts[i], torch.from_numpy(bufs[i]).view(codec.dtype))
+            return ok
+        keys, bufs, owner = [], [], []
+        for i, start in enumerate(starts):
+            segs = codec.direct_buffers(pool, start)
+            keys += page_keys[i]
+            bufs += segs
+            owner += [i] * len(segs)
+        got = [True] * len(starts)
+        for i, good in zip(owner, self._batch.get_into(keys, bufs)):
+            got[i] = got[i] and good
+        return got
 
     def _batch_v1(self, keys, host_indices, transfer, verb, err_stat, stat_of):
-        """Shared v1 transfer shape for batch_get_v1 / batch_set_v1: resolve
-        page views, run `transfer(full_keys, views)`, account per-result via
-        `stat_of(ok)`; any exception fails the whole batch under `err_stat`.
-        """
+        """Shared v1 shape for batch_get_v1 / batch_set_v1: `transfer(pool,
+        full_keys, page_starts)`, accounted per result; any exception fails the
+        whole batch under `err_stat`."""
         full_keys = [self._full_key(k) for k in keys]
         try:
+            if self._mem_pool_host is None:
+                raise RuntimeError("register_mem_pool_host has not been called")
             starts = _page_start_indices(keys, host_indices)
-            views = [self._page_view(s) for s in starts]
-            results = list(transfer(full_keys, views))
+            results = list(transfer(self._mem_pool_host, full_keys, starts))
         except Exception as e:  # noqa: BLE001
             log.debug("batch %s error (n=%d): %r", verb, len(keys), e)
             self._stats[err_stat] += len(keys)
@@ -364,7 +483,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         return self._batch_v1(
             keys,
             host_indices,
-            self._batch.get_into,
+            self._get_pages,
             "get_into",
             "get_error",
             lambda ok: "get_hit" if ok else "get_miss",
@@ -374,7 +493,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         return self._batch_v1(
             keys,
             host_indices,
-            lambda fk, views: self._batch.put_from(fk, views, self._ttl_secs),
+            self._put_pages,
             "put_from",
             "set_error",
             lambda ok: "set_ok" if ok else "set_error",
@@ -397,13 +516,15 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         """
         if not keys:
             return 0
-        full_keys = [self._full_key(k) for k in keys]
         try:
-            if not run(lambda: self._client.head(full_keys[0])):
+            # Inside: classifying the pool reads a page, and this runs on
+            # sglang's prefetch thread, which has no handler.
+            page_keys = self._page_keys(DEFAULT_POOL_NAME, keys)
+            if not self._present(page_keys[:1])[0]:
                 return 0  # cold prefix — one probe, no fan-out
-            if len(full_keys) == 1:
+            if len(page_keys) == 1:
                 return 1
-            founds = list(run(lambda: self._client.batch_head(full_keys)))
+            founds = self._present(page_keys)
         except Exception as e:  # noqa: BLE001
             log.debug("batch_exists head error (n=%d): %r", len(keys), e)
             return 0
@@ -429,8 +550,8 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     # which is what `PoolName.KV` stringifies to. So v2 keys for the KV pool are
     # byte-identical to v1's — this is additive, not a migration.
 
-    def _pool_page_view(self, pool_name, idx: int):
-        """Page view resolved against the pool that OWNS the index.
+    def _pool_for(self, pool_name):
+        """The host pool that OWNS a pool's indices.
 
         v1 could assume one host pool. Under v2 each transfer names its pool and
         `host_indices` index into that pool's buffer, so resolving them against
@@ -448,15 +569,16 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                 f"no host pool registered for {pool_name!r}; "
                 f"known={sorted(str(k) for k in pools)}"
             )
-        page = pool.get_data_page(int(idx), flat=True)
-        if hasattr(page, "view") and hasattr(page, "dtype") and hasattr(page, "numpy"):
-            try:
-                import torch
+        return pool
 
-                return page.view(torch.uint8).numpy()
-            except ImportError:
-                return page.numpy()
-        return page
+    def _page_keys(self, pool_name, keys) -> List[List[bytes]]:
+        """The stored keys of each page, in the form its pool stores pages."""
+        try:
+            codec = self._codec(self._pool_for(pool_name))
+        except RuntimeError:
+            # No pool yet: only the base key can be probed.
+            return [[self._full_key(k, pool_name)] for k in keys]
+        return [codec.keys(self._full_key(k, pool_name)) for k in keys]
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
         """Longest usable prefix, folded across every pool.
@@ -522,8 +644,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         """
         if not keys:
             return []
-        full_keys = [self._full_key(k, pool_name) for k in keys]
-        return list(run(lambda: self._client.batch_head(full_keys)))
+        return self._present(self._page_keys(pool_name, keys))
 
     def _batch_v2(self, transfers, transfer_fn, verb: str):
         """Shared shape for batch_get_v2 / batch_set_v2.
@@ -542,8 +663,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             full_keys = [self._full_key(k, name) for k in t_keys]
             try:
                 starts = _page_start_indices(t_keys, t.host_indices)
-                views = [self._pool_page_view(t.name, i) for i in starts]
-                results[name] = list(transfer_fn(full_keys, views))
+                results[name] = list(transfer_fn(self._pool_for(t.name), full_keys, starts))
             except Exception as e:  # noqa: BLE001
                 log.debug("batch %s_v2 pool=%s error (n=%d): %r",
                           verb, name, len(t_keys), e)
@@ -560,16 +680,12 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     def batch_get_v2(self, transfers, extra_info=None):
         if not _SGLANG_V2_AVAILABLE:
             raise NotImplementedError("sglang v2 pool types unavailable")
-        return self._batch_v2(transfers, self._batch.get_into, "get")
+        return self._batch_v2(transfers, self._get_pages, "get")
 
     def batch_set_v2(self, transfers, extra_info=None):
         if not _SGLANG_V2_AVAILABLE:
             raise NotImplementedError("sglang v2 pool types unavailable")
-        return self._batch_v2(
-            transfers,
-            lambda fk, views: self._batch.put_from(fk, views, self._ttl_secs),
-            "set",
-        )
+        return self._batch_v2(transfers, self._put_pages, "set")
 
     # ── v0 thin wrappers (off hot path once interface_v1=1) ────────────────
 

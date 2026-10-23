@@ -22,8 +22,14 @@ import pytest
 # The fail-closed path does no tensor math (it bails before the inject loop);
 # stub the heavy natives so the connector imports without a GPU/cluster. numpy
 # stays REAL — start_load_kv sizes its staging buffers with it.
-sys.modules.setdefault("torch", MagicMock())
-sys.modules.setdefault("autumn", MagicMock())
+# torch is needed for real (the connector imports it); autumn is stubbed only
+# where the native module is missing. A stub left in sys.modules is what every
+# later test module imports too.
+pytest.importorskip("torch")
+try:
+    import autumn  # noqa: F401
+except ImportError:
+    sys.modules["autumn"] = MagicMock()
 np = pytest.importorskip("numpy")
 
 import autumn_kvcache.vllm_connector as vc  # noqa: E402
@@ -59,7 +65,9 @@ def _stub_tensor_ops(monkeypatch):
     """`_extract_layer` returns a template we can size a staging buffer from;
     `_inject_layer` is a spy so a test can assert how many layers were written."""
     calls = []
-    tmpl = SimpleNamespace(numel=lambda: 4, element_size=lambda: 2, dtype="f16", shape=(4,))
+    # The dtype of whichever torch is loaded (the real one, or the stub).
+    tmpl = SimpleNamespace(numel=lambda: 4, element_size=lambda: 2,
+                           dtype=sys.modules["torch"].float16, shape=(4,))
     monkeypatch.setattr(vc, "_extract_layer", lambda *a, **k: tmpl)
     monkeypatch.setattr(vc, "_inject_layer", lambda *a, **k: calls.append(a))
     return calls

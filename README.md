@@ -225,6 +225,21 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 AUTUMN_KVCACHE_TRANSPORT=tcp \
   every page (its own L1/L2 + hash manage existence, so an expired L3 key is a
   clean miss); the vLLM connector additionally keeps the completion marker's TTL
   shorter than its layers' (see above) to preserve load correctness.
+- **sglang host-pool layouts** — a page is read into, and written from, the
+  host pool itself. Where the page (MLA `page_first*`) or each of its K/V
+  halves (MHA `page_first*`) is a window into the pool, it moves with no copy;
+  otherwise (`layer_first`, the default, and pools that assemble a page, such
+  as Mamba) it is copied out to write, and a read lands in a scratch buffer
+  that `set_from_flat_data_page` puts into the pool. Stored bytes follow the
+  pool's own order, so every layout but `layer_first` carries its name in the
+  key: instances with different layouts never read each other's pages. For the
+  copy-free path, run sglang with `--hicache-mem-layout page_first_direct`.
+  These layouts need the v1 interface (`"interface_v1": 1`); the v0 wrappers
+  use the untagged key.
+- **No duplicate writes** — a page already stored (all of its values present)
+  is not written again; one existence probe per batch. Its `ttl_secs`
+  therefore counts from the first write: backing a hot page up again does not
+  extend it.
 - **Return fast** — never block past the engine's step budget; the load path is
   synchronous in Phase 3a (per-layer overlap is Phase 3b).
 - **Model-scope isolation** — keys carry a model scope derived from model +
@@ -237,4 +252,5 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 AUTUMN_KVCACHE_TRANSPORT=tcp \
 
 ```bash
 uv run --with pytest python -m pytest tests/test_model_identity.py -q   # from this repo root
+python -m pytest tests/test_page_layouts.py -q   # needs torch; every sglang host-pool layout
 ```

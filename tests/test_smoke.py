@@ -85,7 +85,8 @@ def main() -> int:
 
     # ── model-scope sanity: keys are namespaced ──────────────────────────
     sample_key = backend._full_key(_make_key(0))
-    assert sample_key.startswith(b"kvc/smoke-model_0_1/kv/"), (
+    # Relative to the client's `kvc` scope, which the client prepends.
+    assert sample_key.startswith(b"smoke-model_0_1/kv/"), (
         f"unexpected key format: {sample_key!r}"
     )
     log.info("model-scope key format OK: %r", sample_key)
