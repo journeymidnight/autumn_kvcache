@@ -125,6 +125,7 @@ class FakeStore:
 
     def __init__(self):
         self.data, self.put_bufs, self.get_bufs = {}, [], []
+        self.exists_calls = self.head_calls = 0
 
     def put_from(self, keys, bufs, ttl_secs=0):
         self.put_bufs += bufs
@@ -143,7 +144,12 @@ class FakeStore:
             out.append(ok)
         return out
 
+    def exists(self, keys):
+        self.exists_calls += 1
+        return [bytes(k) in self.data for k in keys]
+
     async def batch_head(self, keys):
+        self.head_calls += 1
         return [bytes(k) in self.data for k in keys]
 
     async def head(self, key):
@@ -283,3 +289,26 @@ def test_a_host_index_off_the_pool_fails_the_batch(start):
     assert b.batch_set_v1(HASHES[:1], indices([0])) == [True]
     assert b.batch_get_v1(HASHES[:1], indices([start])) == [False]
     assert b._stats["get_error"] == 1
+
+
+def test_presence_is_probed_with_the_blocking_call():
+    """BatchClient.exists, not the awaitable batch_head."""
+    store, pool = FakeStore(), MHAPool("page_first")
+    fill(pool, 8)
+    b = backend(store, pool)
+    b.batch_set_v1(HASHES, indices(STARTS))
+    store.exists_calls = 0
+    assert b.batch_exists(HASHES) == len(HASHES)
+    assert (store.exists_calls, store.head_calls) == (2, 0)  # first page, then all
+
+
+def test_presence_falls_back_to_batch_head_without_exists():
+    class OldStore(FakeStore):
+        exists = None  # a native module from before BatchClient.exists
+
+    store, pool = OldStore(), MHAPool("page_first")
+    fill(pool, 9)
+    b = backend(store, pool)
+    assert all(b.batch_set_v1(HASHES, indices(STARTS)))
+    assert b.batch_exists(HASHES) == len(HASHES)
+    assert store.head_calls >= 2

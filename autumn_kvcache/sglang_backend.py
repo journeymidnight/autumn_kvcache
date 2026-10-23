@@ -393,11 +393,11 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         # lifts throughput (~600 MB/s vs ~480 on the asyncio path) and frees
         # the GIL during a batch so sglang's other threads run concurrently.
         #
-        # per_worker_cap bounds in-flight depth per worker, keeping UCX under
-        # its single-worker rendezvous cliff (≤16). client_workers is the
-        # number of Rust worker threads; in-process scaling is currently
-        # capped by the shared process-global ucp_context (workers serialize
-        # on it), so default 1 — >1 is wired for when per-thread contexts land.
+        # client_workers is the number of Rust worker threads, each with its
+        # own connections; the SDK caps each one's requests in flight (32).
+        # Default 1. More helps a lone rank (TCP, 128 x 16 MiB: read 0.38 s
+        # with 4 vs 0.80 s) but costs a node of 8 ranks (aggregate read ~22%
+        # lower with 4), and on UCX workers serialize on one ucp_context.
         default_cap = 16 if transport == "ucx" else 64
         self._max_inflight = int(extra_config.get("max_inflight", default_cap))
         n_workers = max(1, int(extra_config.get("client_workers", 1)))
@@ -448,8 +448,8 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self._batch = autumn.BatchClient(
             endpoint, n_workers, max(1, self._max_inflight), **auth
         )
-        # Low-frequency v0 / batch_exists / clear paths use a regular async
-        # Client on its own loop thread.
+        # Low-frequency v0 / clear paths (and batch_exists with a native module
+        # without BatchClient.exists) use a regular async Client on its own loop thread.
         self._loop0 = new_loop()
         self._client = run_on(self._loop0, lambda: autumn.Client.connect(endpoint, **auth))
         self._mem_pool_host = None
@@ -498,7 +498,10 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     def _present(self, page_keys) -> List[bool]:
         """Per page: every value it is stored as exists."""
         flat = [k for ks in page_keys for k in ks]
-        found = iter(run(lambda: self._client.batch_head(flat)))
+        # BatchClient.exists takes the GIL back once; batch_head (only for a
+        # native module without it) crosses threads several times.
+        exists = getattr(self._batch, "exists", None)
+        found = iter(exists(flat) if exists else run(lambda: self._client.batch_head(flat)))
         return [all([next(found) for _ in ks]) for ks in page_keys]
 
     def _put_pages(self, pool, base_keys, starts) -> List[bool]:
