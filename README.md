@@ -33,6 +33,9 @@ The native `autumn` PyO3 extension must be on the same interpreter:
 # 1) build + install the native autumn client into your venv
 cd python
 maturin build --release --interpreter /path/to/venv/bin/python
+#    for UCX: add `--features ucx --auditwheel skip` — the wheel must link the
+#    system UCX; auditwheel's bundled copy has no mlx5 transport modules, and
+#    the client then cannot connect over RDMA
 /path/to/venv/bin/pip install --force-reinstall target/wheels/autumn-*.whl
 
 # 2) install this package (pure-python) — still in python/ from step 1
