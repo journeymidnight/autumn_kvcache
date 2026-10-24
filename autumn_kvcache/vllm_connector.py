@@ -227,7 +227,7 @@ class _AutumnKVStore:
         endpoint: str,
         model_scope: str,
         transport: str = "tcp",
-        n_workers: int = 1,
+        n_workers: Optional[int] = None,
         max_inflight: Optional[int] = None,
         ttl_secs: int = 0,
         direct_read: bool = True,
@@ -271,6 +271,9 @@ class _AutumnKVStore:
                 transport = "tcp"
         default_cap = 16 if transport == "ucx" else 64
         cap = int(max_inflight) if max_inflight else default_cap
+        # One worker tops out near 2 GB/s on TCP; see sglang_backend. Decided
+        # after the fallback above, so a failed UCX request gets TCP's default.
+        n_workers = max(1, int(n_workers)) if n_workers else (1 if transport == "ucx" else 8)
         # Hot-path: GIL-releasing batched client (bulk on UCX for large pages).
         # direct_read (default ON) sends ≥64 KiB KV-page gets
         # STRAIGHT to an EN (bypassing the PS); <64 KiB pages stay on the proxy
@@ -589,7 +592,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             endpoint,
             self._model_scope,
             transport=transport,
-            n_workers=max(1, int(extra.get("client_workers", 1))),
+            n_workers=extra.get("client_workers"),
             max_inflight=extra.get("max_inflight"),
             ttl_secs=ttl_secs,
             direct_read=bool(direct_read),

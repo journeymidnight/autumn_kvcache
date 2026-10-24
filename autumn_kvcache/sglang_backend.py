@@ -387,6 +387,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                 log.info("autumn transport set to %s", transport)
             except Exception as e:  # noqa: BLE001
                 log.warning("set_transport(%s) failed, falling back to tcp: %r", transport, e)
+                transport = "tcp"
         # Hot path: the GIL-releasing Rust BatchClient. One PyO3 call extracts
         # all dest pointers under the GIL, then py.allow_threads while Rust
         # workers pipeline transfers + memcpy into the pinned pages. This both
@@ -395,12 +396,16 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         #
         # client_workers is the number of Rust worker threads, each with its
         # own connections; the SDK caps each one's requests in flight (32).
-        # Default 1. More helps a lone rank (TCP, 128 x 16 MiB: read 0.38 s
-        # with 4 vs 0.80 s) but costs a node of 8 ranks (aggregate read ~22%
-        # lower with 4), and on UCX workers serialize on one ucp_context.
+        # One worker tops out near 2 GB/s on TCP (it receives and copies on one
+        # thread). Measured on TCP with the PS memory tier, 128 x 16 MiB: one
+        # rank reads 2 GiB in 1.04 s with 1, 0.29 s with 4, 0.16 s with 8; 8
+        # ranks together 12.8 / 17.5 / 18.3 GB/s; SGLang per-request p50
+        # 980 / 457 ms (1 / 4). UCX keeps 1 (its workers share one
+        # ucp_context) until measured.
         default_cap = 16 if transport == "ucx" else 64
         self._max_inflight = int(extra_config.get("max_inflight", default_cap))
-        n_workers = max(1, int(extra_config.get("client_workers", 1)))
+        default_workers = 1 if transport == "ucx" else 8
+        n_workers = max(1, int(extra_config.get("client_workers", default_workers)))
         # `ttl_secs` (default 0 = no expiry): relative TTL applied to every L3
         # page write. Content-addressed keys never invalidate, so a TTL is the
         # only reclamation knob. sglang manages its own existence (its hash

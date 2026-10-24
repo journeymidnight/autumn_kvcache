@@ -90,7 +90,8 @@ CUDA_VISIBLE_DEVICES=1 vllm serve /models/Qwen3-8B --served-model-name qwen3 \
 ```
 
 `kv_connector_extra_config` keys: `endpoint` (autumn manager `host:port`,
-required), `transport` (`tcp` default, or `ucx`), `client_workers`,
+required), `transport` (`tcp` default, or `ucx`), `client_workers` (Rust
+worker threads; default 8 on TCP, 1 on UCX — one worker tops out near 2 GB/s),
 `max_inflight`, `ttl_secs`, `model_id` (optional explicit model identity — see
 below).
 
