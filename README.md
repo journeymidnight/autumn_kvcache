@@ -47,6 +47,14 @@ the engine import is defensive — so `python -c "from
 autumn_kvcache.vllm_connector import AutumnKVConnector"` works for tooling and
 the data-plane smoke test regardless.
 
+## Faster reads: the partition server's memory tier
+
+Start the partition servers with `--mem-tier-bytes <budget> --mem-tier-prefix kvc/`
+and KV pages are held in their DRAM and acknowledged without a log write; reads
+come from memory. Pages held there are lost on a PS restart (a cache miss, then
+recompute). Measured with SGLang + Qwen3-VL-32B: per-request p50 1344 → 980 ms,
+2 GiB fetch 999 → 699 ms. See autumn-rs `docs/ops.md` ("Memory tier for KV cache").
+
 ## Using autumn-kvcache as a vLLM L3 (cross-instance prefix cache)
 
 `AutumnKVConnector` is a native vLLM V1 KV connector (Phase 3a — CPU-offload
