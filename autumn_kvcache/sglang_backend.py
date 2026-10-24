@@ -389,23 +389,23 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                 log.warning("set_transport(%s) failed, falling back to tcp: %r", transport, e)
                 transport = "tcp"
         # Hot path: the GIL-releasing Rust BatchClient. One PyO3 call extracts
-        # all dest pointers under the GIL, then py.allow_threads while Rust
-        # workers pipeline transfers + memcpy into the pinned pages. This both
-        # lifts throughput (~600 MB/s vs ~480 on the asyncio path) and frees
-        # the GIL during a batch so sglang's other threads run concurrently.
+        # all dest pointers under the GIL, then py.allow_threads while its Rust
+        # worker receives the values straight into the pinned pages, which also
+        # frees the GIL during a batch so sglang's other threads run.
         #
-        # client_workers is the number of Rust worker threads, each with its
-        # own connections; the SDK caps each one's requests in flight (32).
-        # One worker tops out near 2 GB/s on TCP (it receives and copies on one
-        # thread). Measured on TCP with the PS memory tier, 128 x 16 MiB: one
-        # rank reads 2 GiB in 1.04 s with 1, 0.29 s with 4, 0.16 s with 8; 8
-        # ranks together 12.8 / 17.5 / 18.3 GB/s; SGLang per-request p50
-        # 980 / 457 ms (1 / 4). UCX keeps 1 (its workers share one
-        # ucp_context) until measured.
+        # One worker: on UCX the values come by rendezvous (one rank reads
+        # 16 MiB pages from PS memory at ~42 GB/s); on TCP one worker reads
+        # ~5 GB/s, 2 GiB in ~0.4 s against ~1 s to recompute. The old
+        # `client_workers` knob is gone (more workers spent whole cores on TCP
+        # for latency only, each with its own routing and connections).
         default_cap = 16 if transport == "ucx" else 64
         self._max_inflight = int(extra_config.get("max_inflight", default_cap))
-        default_workers = 1 if transport == "ucx" else 8
-        n_workers = max(1, int(extra_config.get("client_workers", default_workers)))
+        if "client_workers" in extra_config:
+            log.warning(
+                "autumn-kvcache: extra_config client_workers=%r is no longer used "
+                "(BatchClient has one worker); remove it",
+                extra_config["client_workers"],
+            )
         # `ttl_secs` (default 0 = no expiry): relative TTL applied to every L3
         # page write. Content-addressed keys never invalidate, so a TTL is the
         # only reclamation knob. sglang manages its own existence (its hash
@@ -451,7 +451,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                 "extra_config: auth_principal set without auth_credential_file"
             )
         self._batch = autumn.BatchClient(
-            endpoint, n_workers, max(1, self._max_inflight), **auth
+            endpoint, per_worker_cap=max(1, self._max_inflight), **auth
         )
         # Low-frequency v0 / clear paths (and batch_exists with a native module
         # without BatchClient.exists) use a regular async Client on its own loop thread.

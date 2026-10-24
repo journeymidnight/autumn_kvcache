@@ -28,7 +28,6 @@ ENDPOINT = os.environ.get("AUTUMN_KVCACHE_ENDPOINT", "127.0.0.1:9001")
 TRANSPORT = os.environ.get("AUTUMN_TRANSPORT", "ucx")
 N_PAGES = int(os.environ.get("AUTUMN_BENCH_PAGES", "512"))
 PAGE = int(os.environ.get("AUTUMN_BENCH_PAGE_KB", "256")) * 1024
-N_WORKERS = int(os.environ.get("AUTUMN_BENCH_WORKERS", "8"))
 CAP = int(os.environ.get("AUTUMN_BENCH_CAP", "8"))
 ROUNDS = int(os.environ.get("AUTUMN_BENCH_ROUNDS", "5"))
 # Every client must bind a key scope. The bench writes into its OWN `bench/`
@@ -38,7 +37,7 @@ NAMESPACE = os.environ.get("AUTUMN_BENCH_NAMESPACE", "bench")
 
 def run():
     # bulk is auto-derived from the transport (set below). bc.bulk() reports it.
-    bc = autumn.BatchClient(ENDPOINT, N_WORKERS, CAP, scope=NAMESPACE)
+    bc = autumn.BatchClient(ENDPOINT, per_worker_cap=CAP, scope=NAMESPACE)
     # One contiguous pool; per-page views (zero-copy numpy slices).
     pool = np.zeros(N_PAGES * PAGE, dtype=np.uint8)
     for i in range(N_PAGES):
@@ -68,7 +67,7 @@ def run():
 def main():
     autumn.set_transport(TRANSPORT)
     print(f"endpoint={ENDPOINT} transport={TRANSPORT} pages={N_PAGES} page={PAGE//1024}KiB "
-          f"workers={N_WORKERS} cap={CAP} rounds={ROUNDS}")
+          f"cap={CAP} rounds={ROUNDS}")
     run()
     print("  (A/B: re-run with AUTUMN_TRANSPORT=tcp vs =ucx)")
 

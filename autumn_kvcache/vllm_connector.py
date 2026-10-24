@@ -227,7 +227,6 @@ class _AutumnKVStore:
         endpoint: str,
         model_scope: str,
         transport: str = "tcp",
-        n_workers: Optional[int] = None,
         max_inflight: Optional[int] = None,
         ttl_secs: int = 0,
         direct_read: bool = True,
@@ -271,9 +270,6 @@ class _AutumnKVStore:
                 transport = "tcp"
         default_cap = 16 if transport == "ucx" else 64
         cap = int(max_inflight) if max_inflight else default_cap
-        # One worker tops out near 2 GB/s on TCP; see sglang_backend. Decided
-        # after the fallback above, so a failed UCX request gets TCP's default.
-        n_workers = max(1, int(n_workers)) if n_workers else (1 if transport == "ucx" else 8)
         # Hot-path: GIL-releasing batched client (bulk on UCX for large pages).
         # direct_read (default ON) sends ≥64 KiB KV-page gets
         # STRAIGHT to an EN (bypassing the PS); <64 KiB pages stay on the proxy
@@ -287,7 +283,7 @@ class _AutumnKVStore:
             "EN-direct" if self._direct_read else "PS-proxy",
         )
         self._batch = autumn.BatchClient(
-            endpoint, max(1, int(n_workers)), max(1, cap), self._direct_read, **self._auth
+            endpoint, per_worker_cap=max(1, cap), direct=self._direct_read, **self._auth
         )
         # Low-frequency existence probing on its own loop thread. The probe
         # client carries the same credential — authz gates reads on protected
@@ -588,11 +584,16 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 "kv_connector_extra_config: auth_principal set without "
                 "auth_credential_file"
             )
+        if "client_workers" in extra:
+            log.warning(
+                "autumn-kvcache: kv_connector_extra_config client_workers=%r is no "
+                "longer used (BatchClient has one worker); remove it",
+                extra["client_workers"],
+            )
         self._store = _AutumnKVStore(
             endpoint,
             self._model_scope,
             transport=transport,
-            n_workers=extra.get("client_workers"),
             max_inflight=extra.get("max_inflight"),
             ttl_secs=ttl_secs,
             direct_read=bool(direct_read),
@@ -619,8 +620,8 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # it here (req_id -> [(layer_name, gpu_tensor)]); wait_for_save hands a
         # full set to one background thread that does the EXPENSIVE work off the
         # prefill critical path: the D2H `.cpu()` copy, the store-dedup probe, the
-        # durable put_from, and the marker. One worker thread is enough — put_from
-        # already fans across the BatchClient's own workers.
+        # durable put_from, and the marker. One worker thread: put_from hands the
+        # whole batch to the BatchClient's worker.
         self._pending_saves: dict = {}
         self._save_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autumn-kvc-save")
         self._inflight_lock = threading.Lock()
