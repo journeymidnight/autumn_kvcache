@@ -24,7 +24,6 @@ import time
 
 import numpy as np
 
-from autumn_kvcache._keys import KEY_NAMESPACE
 from autumn_kvcache.vllm_connector import (
     _KV_STORAGE_FORMAT,
     VLLM_POOL_NAME,
@@ -67,9 +66,8 @@ def main() -> int:
 
     # ── 2. key format ────────────────────────────────────────────────────────
     k = store._key("deadbeef", "layer.7")
-    expected = (
-        f"{KEY_NAMESPACE}/{model_scope}/{VLLM_POOL_NAME}/{_KV_STORAGE_FORMAT}/deadbeef/layer.7".encode()
-    )
+    # Relative: the client is bound to the `kvc` scope and prepends `kvc/`.
+    expected = f"{model_scope}/{VLLM_POOL_NAME}/{_KV_STORAGE_FORMAT}/deadbeef/layer.7".encode()
     assert k == expected, f"key mismatch: {k!r} != {expected!r}"
     log.info("key format OK: %r", k)
 
@@ -108,6 +106,15 @@ def main() -> int:
     assert store.is_present(chash) is True, "marker must exist after mark_present"
     assert store.is_present(prefix_hash([5, 5], 2)) is False
     log.info("presence-marker (mark_present/is_present) OK")
+
+    # unmark_present does not wait: poll for the delete to land.
+    store.unmark_present(chash)
+    deadline = time.time() + 5
+    while store.is_present(chash) and time.time() < deadline:
+        time.sleep(0.05)
+    assert store.is_present(chash) is False, "unmark_present must delete the marker"
+    assert store.exists(chash, "layer.0") is True, "unmark_present must leave the layers"
+    log.info("unmark_present OK")
 
     # ── 5. partial-load miss is graceful (no crash, returns False) ───────────
     miss_dst = [np.zeros(page_bytes, dtype=np.uint8)]

@@ -40,11 +40,17 @@ class _FakeStore:
         self._oks = oks
         self.marker_ttl = 0
         self.model_scope = "qwen7b_deadbeef_0_1"
+        self.unmarked = []
 
     def load_layers(self, content_hash, layer_names, dests):
+        self.loads = getattr(self, "loads", 0) + 1
         # Mirror the real contract: one bool per layer (or a short list on a
         # backend fault) — start_load_kv must treat both as fail-closed.
         return list(self._oks)
+
+    def unmark_present(self, content_hash):
+        self.unmarked.append(content_hash)
+        return True
 
 
 def _mk_connector(oks, block_ids):
@@ -53,6 +59,7 @@ def _mk_connector(oks, block_ids):
     conn._block_size = 16
     conn._kv_caches = {"model.layers.0.attn": 0, "model.layers.1.attn": 1, "model.layers.2.attn": 2}
     conn._load_failed_block_ids = set()
+    conn._failed_hashes = set()
     conn._store = _FakeStore(oks)
     meta = vc.AutumnConnectorMetadata()
     meta.add("req-1", "hash-1", list(range(16)), is_store=False, block_ids=block_ids)
@@ -96,3 +103,53 @@ def test_full_load_injects_every_layer_and_reports_no_errors(_stub_tensor_ops):
     conn.start_load_kv(forward_context=None)
     assert len(_stub_tensor_ops) == 3, "all layers present -> inject all three"
     assert conn.get_block_ids_with_load_errors() == set()
+
+
+def test_partial_load_deletes_the_marker(_stub_tensor_ops):
+    # The memory tier evicts layers while the probed marker stays; a kept
+    # marker would admit failing loads and stop the prefix being saved again.
+    conn = _mk_connector(oks=[True, False, True], block_ids=[5, 6])
+    conn.start_load_kv(forward_context=None)
+    assert conn._store.unmarked == ["hash-1"]
+
+
+def test_full_load_keeps_the_marker(_stub_tensor_ops):
+    conn = _mk_connector(oks=[True, True, True], block_ids=[5, 6])
+    conn.start_load_kv(forward_context=None)
+    assert conn._store.unmarked == []
+
+
+def test_a_hash_that_failed_this_step_is_not_fetched_again(_stub_tensor_ops):
+    conn = _mk_connector(oks=[True, False, True], block_ids=[5, 6])
+    conn._meta.add("req-2", "hash-1", list(range(16)), is_store=False, block_ids=[7])
+    conn.start_load_kv(forward_context=None)
+    assert conn._store.loads == 1
+    assert conn._store.unmarked == ["hash-1"]
+    assert conn.get_block_ids_with_load_errors() == {5, 6, 7}
+
+
+def test_the_failed_hash_is_reported_to_the_scheduler_once(_stub_tensor_ops, monkeypatch):
+    monkeypatch.setattr(vc, "_WORKER_META", True)
+    conn = _mk_connector(oks=[True, False, True], block_ids=[5, 6])
+    conn.start_load_kv(forward_context=None)
+    assert conn.build_connector_worker_meta() == vc.AutumnWorkerMetadata(frozenset({"hash-1"}))
+    assert conn.build_connector_worker_meta() is None
+
+
+def test_ranks_reports_are_unioned():
+    a = vc.AutumnWorkerMetadata(frozenset({"h1"}))
+    b = vc.AutumnWorkerMetadata(frozenset({"h2", "h1"}))
+    assert a.aggregate(b).failed_hashes == {"h1", "h2"}
+
+
+def test_the_scheduler_deletes_the_markers_the_workers_report():
+    # Under TP>1 the scheduler probes rank 0's marker; a failing worker of
+    # another rank deletes only its own. The request may already be freed
+    # (kv_load_failure_policy="fail"), so nothing per-request is consulted.
+    conn = vc.AutumnKVConnector.__new__(vc.AutumnKVConnector)
+    conn._store = _FakeStore([])
+    conn.update_connector_output(SimpleNamespace(kv_connector_worker_meta=None, invalid_block_ids={5}))
+    assert conn._store.unmarked == []
+    meta = vc.AutumnWorkerMetadata(frozenset({"h1", "h2"}))
+    conn.update_connector_output(SimpleNamespace(kv_connector_worker_meta=meta, invalid_block_ids={5}))
+    assert sorted(conn._store.unmarked) == ["h1", "h2"]

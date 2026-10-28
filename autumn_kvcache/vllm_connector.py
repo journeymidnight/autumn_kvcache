@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import autumn
 
-from ._bridge import new_loop, run, run_on
+from ._bridge import new_loop, run, run_on, submit
 from ._identity import read_credential_pair as _read_credential_pair, model_scope_cfg_from_vllm as _model_scope_cfg_from_vllm
 from ._keys import VLLM_KV_STORAGE_FORMAT, build_model_scope, full_key
 
@@ -71,6 +71,12 @@ _KV_STORAGE_FORMAT = VLLM_KV_STORAGE_FORMAT
 # present" holds across both the save ordering (marker written last) and the
 # scheduler-probe → worker-load gap. The grace just delays reclamation of
 # already-cold pages; content-addressing makes the lingering harmless.
+# The partition server's memory tier breaks the invariant: eviction, or a PS
+# restart that loses the tier while a durable marker survives, can leave a
+# marker without its layers. Such a marker would keep admitting failing loads
+# and keep the save job skipping the prefix, so a failed load deletes it: the
+# worker its own rank's, the scheduler the one it probes
+# (update_connector_output).
 #
 # Belt-and-suspenders: the marker is also gated on the layers ACTUALLY saving
 # (see _save_failed / wait_for_save) — so a save failure for ANY reason (the
@@ -108,6 +114,14 @@ except Exception:  # noqa: BLE001
         WORKER = 1
 
     _VLLM_AVAILABLE = False
+
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorWorkerMetadata
+
+    _WORKER_META = True
+except Exception:  # noqa: BLE001 — older vLLM: workers cannot report back
+    KVConnectorWorkerMetadata = object  # type: ignore[misc,assignment]
+    _WORKER_META = False
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
@@ -340,6 +354,17 @@ class _AutumnKVStore:
             log.debug("mark_present error: %r", e)
             return False
 
+    def unmark_present(self, content_hash: str) -> None:
+        """Delete the marker of a prefix whose layers are gone. Does not wait:
+        it is called on the engine step."""
+        key = self._key(content_hash, self.PRESENT_MARKER)
+
+        def _done(fut):
+            if not fut.cancelled() and fut.exception() is not None:
+                log.warning("unmark_present error: %r", fut.exception())
+
+        submit(lambda: self._client.delete(key)).add_done_callback(_done)
+
     def is_present(self, content_hash: str) -> bool:
         """Scheduler-side existence probe — layer-name independent."""
         return self.exists(content_hash, self.PRESENT_MARKER)
@@ -400,6 +425,16 @@ class AutumnConnectorMetadata(KVConnectorMetadata):  # type: ignore[misc]
         self.requests.append(
             _ReqMeta(req_id, content_hash, slot_mapping, is_store, list(block_ids or []))
         )
+
+
+@dataclass
+class AutumnWorkerMetadata(KVConnectorWorkerMetadata):  # type: ignore[misc]
+    """Worker → scheduler, per step: content hashes whose load failed."""
+
+    failed_hashes: frozenset = frozenset()
+
+    def aggregate(self, other: "AutumnWorkerMetadata") -> "AutumnWorkerMetadata":
+        return AutumnWorkerMetadata(self.failed_hashes | other.failed_hashes)
 
 
 # ── torch helpers (worker side, vLLM runtime only) ──────────────────────────
@@ -615,6 +650,9 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # vLLM re-runs normal prefill for those tokens instead of decoding on
         # half-loaded / uninitialised paged KV.
         self._load_failed_block_ids: set = set()
+        # Worker: content hashes whose load failed since the last
+        # build_connector_worker_meta.
+        self._failed_hashes: set = set()
         # Async save (see _MAX_INFLIGHT_SAVES). save_kv_layer only does the cheap
         # GPU-side gather (`_extract_layer` → a standalone tensor) and accumulates
         # it here (req_id -> [(layer_name, gpu_tensor)]); wait_for_save hands a
@@ -712,6 +750,16 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             meta.add(req_id, chash, slots, is_store=is_store, block_ids=block_ids)
         return meta
 
+    def update_connector_output(self, connector_output: Any) -> None:
+        # The scheduler probes only its own scope's marker; a failing worker of
+        # another rank deletes only its own. Hashes, not requests: under the
+        # default kv_load_failure_policy the failed request is already freed.
+        meta = getattr(connector_output, "kv_connector_worker_meta", None)
+        if isinstance(meta, AutumnWorkerMetadata):
+            for chash in meta.failed_hashes:
+                log.info("load failed on a worker: deleting the marker of %s", chash)
+                self._store.unmark_present(chash)
+
     def request_finished(self, request: Any, block_ids: List[int]):
         # Blocks free immediately: save_kv_layer gathered each layer into a
         # STANDALONE GPU tensor (decoupled from the paged blocks), so neither the
@@ -767,10 +815,14 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         meta = self._meta
         if meta is None:
             return
+        failed_hashes: set = set()
         for rm in meta.requests:
             if rm.is_store:
                 continue
             if _slot_len(rm.slot_mapping) == 0:
+                continue
+            if rm.content_hash in failed_hashes:
+                self._load_failed_block_ids.update(rm.block_ids)
                 continue
             # Build one staging buffer per layer, then fetch ALL layers in ONE
             # batched zero-copy get (`load_layers` → BatchClient.get_into, bulk on
@@ -800,11 +852,11 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 # (a DIFFERENT model wrote this model scope) or a backend
                 # fault; with a TTL a grace breach is also possible.
                 causes = (
-                    "possible TTL grace breach, model identity mismatch, "
-                    "or backend fault"
+                    "memory-tier eviction, possible TTL grace breach, model "
+                    "identity mismatch, or backend fault"
                     if self._store.marker_ttl > 0
-                    else "ttl=0 rules out expiry — likely a model identity "
-                    "mismatch (a DIFFERENT model/engine wrote this model scope) or a "
+                    else "memory-tier eviction, or a model identity mismatch "
+                    "(a DIFFERENT model/engine wrote this model scope), or a "
                     "backend fault"
                 )
                 n_missing = sum(1 for ok in oks if not ok) + (len(layer_names) - len(oks))
@@ -815,6 +867,10 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                     rm.req_id, self._store.model_scope, n_missing, len(layer_names), causes,
                 )
                 self._load_failed_block_ids.update(rm.block_ids)
+                failed_hashes.add(rm.content_hash)
+                if _WORKER_META:
+                    self._failed_hashes.add(rm.content_hash)
+                self._store.unmark_present(rm.content_hash)
                 continue
             for layer_name, template, staging in zip(layer_names, templates, stagings):
                 kv_layer = self._kv_caches[layer_name]
@@ -824,6 +880,13 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
     def wait_for_layer_load(self, layer_name: str) -> None:
         # Phase 3a loads synchronously in start_load_kv; nothing to await.
         return None
+
+    def build_connector_worker_meta(self) -> Optional[AutumnWorkerMetadata]:
+        if not self._failed_hashes:
+            return None
+        meta = AutumnWorkerMetadata(frozenset(self._failed_hashes))
+        self._failed_hashes = set()
+        return meta
 
     def get_block_ids_with_load_errors(self) -> set:
         """Blocks whose external KV load failed this step → vLLM re-runs prefill.

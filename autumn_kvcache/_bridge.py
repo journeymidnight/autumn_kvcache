@@ -56,6 +56,11 @@ def run(thunk):
     return fut.result()
 
 
+def submit(thunk):
+    """Like `run`, without waiting: returns the concurrent future."""
+    return asyncio.run_coroutine_threadsafe(_wrap_thunk(thunk), get_loop())
+
+
 def new_loop() -> asyncio.AbstractEventLoop:
     """Create and start a fresh asyncio loop on its own daemon thread.
 

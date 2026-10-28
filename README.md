@@ -55,6 +55,13 @@ come from memory. Pages held there are lost on a PS restart (a cache miss, then
 recompute). Measured with SGLang + Qwen3-VL-32B: per-request p50 1344 → 980 ms,
 2 GiB fetch 999 → 699 ms. See autumn-rs `docs/ops.md` ("Memory tier for KV cache").
 
+The tier can evict a prefix's layers while its vLLM `__present__` marker stays.
+A load that then finds a layer missing injects nothing, and the connector
+deletes that marker (the worker its own rank's, the scheduler the one it
+probes), so the next request for the prefix saves it again. Run vLLM with
+`kv_load_failure_policy="recompute"`: under the default `"fail"` the request
+whose load failed ends with an error instead of being recomputed.
+
 ## Using autumn-kvcache as a vLLM L3 (cross-instance prefix cache)
 
 `AutumnKVConnector` is a native vLLM V1 KV connector (Phase 3a — CPU-offload
