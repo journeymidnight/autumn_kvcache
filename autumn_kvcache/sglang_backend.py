@@ -227,7 +227,11 @@ class _PageCodec:
             self.dtype = page.dtype
             self.nbytes = page.numel() * page.element_size()
         self.page_size = getattr(pool, "page_size", None)
-        self.pages = _page_axis(pool, page, self.page_size)
+        self.pages, storage = _page_axis(pool, page, self.page_size)
+        # The pool's storage, registered once when pages move straight from and
+        # into it: zero-copy over UCX. Otherwise every page is copied through
+        # autumn's pool (UCX never registers memory itself).
+        self.region = autumn.register(storage) if storage is not None and self.kind != self.COPY else None
         if self.pages is not None:
             import torch
 
@@ -295,22 +299,23 @@ def _page_axis(pool, page, page_size):
     same-shaped views of one storage at a fixed stride (every sglang KV pool;
     not one that assembles a page, like Mamba); None otherwise. Its buffers
     are numpy slices: no torch call per page, so no GIL retake per page behind
-    sglang's busy scheduler thread."""
+    sglang's busy scheduler thread. Returned with the storage it views, as one
+    flat uint8 array (to register), or `(None, None)`."""
     if not _is_tensor(page) or not page_size:
-        return None
+        return None, None
     try:
         probes = [page] + [pool.get_data_page(k * page_size, flat=False) for k in (1, 2)]
     except Exception:  # noqa: BLE001 — a pool shorter than three pages
-        return None
+        return None, None
     storage = page.untyped_storage()
     if any(p.untyped_storage().data_ptr() != storage.data_ptr()
            or tuple(p.shape) != tuple(page.shape) or p.stride() != page.stride() for p in probes):
-        return None
+        return None, None
     es = page.element_size()
     offs = [p.storage_offset() * es for p in probes]
     step = offs[1] - offs[0]
     if step <= 0 or offs[2] - offs[1] != step or any(st <= 0 for st in page.stride()):
-        return None
+        return None, None
     import torch
 
     raw = torch.empty(0, dtype=torch.uint8).set_(storage, 0, (storage.nbytes(),), (1,)).numpy()
@@ -327,11 +332,12 @@ def _page_axis(pool, page, page_size):
             merged[0][0] *= n
         else:
             merged.insert(0, [n, st])
-    return np.lib.stride_tricks.as_strided(
+    pages = np.lib.stride_tricks.as_strided(
         raw[offs[0]:],
         shape=(count, *(n for n, _ in merged)),
         strides=(step, *(st for _, st in merged)),
     )
+    return pages, raw
 
 
 class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
@@ -477,8 +483,11 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     def register_mem_pool_host(self, mem_pool_host):
         """Cache the pinned-host KV pool reference; pages move to and from
-        it through `_PageCodec`."""
+        it through `_PageCodec`. Its codec is made here, at engine start, so
+        registering the pool with autumn (once) fails there, loudly, and is
+        never raced by the prefetch and backup threads."""
         self._mem_pool_host = mem_pool_host
+        self._codec(mem_pool_host)
 
     def _full_key(self, hash_str: str, pool_name: str = DEFAULT_POOL_NAME) -> bytes:
         return full_key(self._model_scope, hash_str, pool_name)
@@ -493,12 +502,19 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     def _scratch(self, nbytes: int):
         """A per-thread receive buffer for `copy` pages (prefetch and backup
-        run on different threads), grown on demand and reused."""
+        run on different threads), grown on demand and reused; registered
+        with autumn whenever it is made (`_scratch_region`)."""
         local = self.__dict__.setdefault("_scratch_local", threading.local())
         buf = getattr(local, "buf", None)
         if buf is None or buf.size < nbytes:
+            local.region = None  # the old buffer's registration goes with it
             buf = local.buf = np.empty(nbytes, dtype=np.uint8)
+            local.region = autumn.register(buf)
         return buf
+
+    def _scratch_region(self):
+        """This thread's scratch buffer's registration, if it has one."""
+        return getattr(self.__dict__.get("_scratch_local"), "region", None)
 
     def _present(self, page_keys) -> List[bool]:
         """Per page: every value it is stored as exists."""
@@ -534,7 +550,8 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                     keys += page_keys[i]
                     bufs += segs
                     owner += [i] * len(segs)
-            ok = list(self._batch.put_from(keys, bufs, self._ttl_secs))
+            region = self._scratch_region() if codec.kind == _PageCodec.COPY else codec.region
+            ok = list(self._batch.put_from(keys, bufs, self._ttl_secs, region))
             for i in todo:
                 stored[i] = True
             for i, good in zip(owner, ok):
@@ -548,7 +565,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         if codec.kind == _PageCodec.COPY:
             scratch = self._scratch(len(starts) * codec.nbytes)
             bufs = [scratch[i * codec.nbytes:(i + 1) * codec.nbytes] for i in range(len(starts))]
-            ok = list(self._batch.get_into([ks[0] for ks in page_keys], bufs))
+            ok = list(self._batch.get_into([ks[0] for ks in page_keys], bufs, self._scratch_region()))
             codec.copy_in(pool, starts, scratch, ok)
             return ok
         keys, bufs, owner = [], [], []
@@ -558,7 +575,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             bufs += segs
             owner += [i] * len(segs)
         got = [True] * len(starts)
-        for i, good in zip(owner, self._batch.get_into(keys, bufs)):
+        for i, good in zip(owner, self._batch.get_into(keys, bufs, codec.region)):
             got[i] = got[i] and good
         return got
 

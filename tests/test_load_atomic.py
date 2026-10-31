@@ -42,7 +42,7 @@ class _FakeStore:
         self.model_scope = "qwen7b_deadbeef_0_1"
         self.unmarked = []
 
-    def load_layers(self, content_hash, layer_names, dests):
+    def load_layers(self, content_hash, layer_names, dests, region=None):
         self.loads = getattr(self, "loads", 0) + 1
         # Mirror the real contract: one bool per layer (or a short list on a
         # backend fault) — start_load_kv must treat both as fail-closed.
@@ -61,6 +61,7 @@ def _mk_connector(oks, block_ids):
     conn._load_failed_block_ids = set()
     conn._failed_hashes = set()
     conn._store = _FakeStore(oks)
+    conn._load_arena = vc._Arena()
     meta = vc.AutumnConnectorMetadata()
     meta.add("req-1", "hash-1", list(range(16)), is_store=False, block_ids=block_ids)
     conn._meta = meta

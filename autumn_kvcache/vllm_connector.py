@@ -58,7 +58,8 @@ _MAX_INFLIGHT_SAVES = 2
 # The connector's own KV-layout / storage-format version. Moved to `_keys.py`
 # (pure, offline-testable + pinned by test_model_identity.py) — it is baked
 # into every key path AND the model fingerprint. BUMP it whenever
-# `_extract_layer` / `_inject_layer` / `_byte_view` / the key scheme changes;
+# `_extract_layer` / `_inject_layer` / the save's byte copy (`_run_save_job`) /
+# the key scheme changes;
 # see the invariant comment at its definition.
 _KV_STORAGE_FORMAT = VLLM_KV_STORAGE_FORMAT
 
@@ -369,24 +370,27 @@ class _AutumnKVStore:
         """Scheduler-side existence probe — layer-name independent."""
         return self.exists(content_hash, self.PRESENT_MARKER)
 
-    def save_layers(self, content_hash: str, layer_names: List[str], views: List[Any]) -> List[bool]:
+    def save_layers(self, content_hash: str, layer_names: List[str], views: List[Any], region=None) -> List[bool]:
         """Batched zero-copy put of one page per (content_hash, layer).
 
         `views` are buffer-protocol objects (numpy uint8 / torch byte view);
-        len(views) == len(layer_names).
+        len(views) == len(layer_names). Over UCX, views inside `region` (an
+        `autumn.register` result) are sent from where they are; others are
+        copied through autumn's pool first.
         """
         keys = [self._key(content_hash, ln) for ln in layer_names]
         try:
-            return list(self._batch.put_from(keys, views, self._layer_ttl))
+            return list(self._batch.put_from(keys, views, self._layer_ttl, region))
         except Exception as e:  # noqa: BLE001
             log.debug("save_layers put_from error (n=%d): %r", len(keys), e)
             return [False] * len(keys)
 
-    def load_layers(self, content_hash: str, layer_names: List[str], dests: List[Any]) -> List[bool]:
-        """Batched zero-copy get into per-layer destination buffers."""
+    def load_layers(self, content_hash: str, layer_names: List[str], dests: List[Any], region=None) -> List[bool]:
+        """Batched get into per-layer destination buffers; over UCX, dests
+        inside `region` receive with no copy (as `save_layers`)."""
         keys = [self._key(content_hash, ln) for ln in layer_names]
         try:
-            return list(self._batch.get_into(keys, dests))
+            return list(self._batch.get_into(keys, dests, region))
         except Exception as e:  # noqa: BLE001
             log.debug("load_layers get_into error (n=%d): %r", len(keys), e)
             return [False] * len(keys)
@@ -503,11 +507,30 @@ def _inject_layer(
         kv_layer[block_idxs, :, offsets] = val
 
 
-def _byte_view(t: "torch.Tensor"):
-    """uint8 numpy view of a CPU tensor's bytes (zero-copy bit-reinterpret)."""
-    import torch
+class _Arena:
+    """A host buffer reused for every transfer of one thread, registered with
+    autumn whenever it is (re)made: pages sent from it or received into it move
+    zero-copy over UCX, where fresh memory each time would be copied through
+    autumn's pool. Grows to the largest batch; one thread owns each."""
 
-    return t.contiguous().view(torch.uint8).numpy()
+    def __init__(self):
+        self._buf = None
+        self.region = None
+
+    def take(self, sizes: List[int]):
+        """Consecutive slices of the given sizes; valid until the next take."""
+        import numpy as np
+
+        total = sum(sizes)
+        if self._buf is None or self._buf.size < total:
+            self.region = None  # the old buffer's registration goes with it
+            self._buf = np.empty(total, dtype=np.uint8)
+            self.region = autumn.register(self._buf)
+        out, at = [], 0
+        for n in sizes:
+            out.append(self._buf[at : at + n])
+            at += n
+        return out
 
 
 # ── the connector ────────────────────────────────────────────────────────────
@@ -662,6 +685,8 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # whole batch to the BatchClient's worker.
         self._pending_saves: dict = {}
         self._save_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autumn-kvc-save")
+        self._save_arena = _Arena()  # the save thread's
+        self._load_arena = _Arena()  # the forward thread's (start_load_kv)
         self._inflight_lock = threading.Lock()
         self._inflight_saves = 0
         log.info(
@@ -829,13 +854,13 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             # UCX, fans across workers) — was 64 separate round trips per request.
             layer_names = list(self._kv_caches.keys())
             templates = []
-            stagings = []
             for layer_name in layer_names:
                 kv_layer = self._kv_caches[layer_name]
-                template = _extract_layer(kv_layer, rm.slot_mapping, self._is_mla, self._block_size)
-                templates.append(template)
-                stagings.append(np.empty(template.numel() * template.element_size(), dtype=np.uint8))
-            oks = self._store.load_layers(rm.content_hash, layer_names, stagings)
+                templates.append(_extract_layer(kv_layer, rm.slot_mapping, self._is_mla, self._block_size))
+            # Reused across requests: injection below copies each layer to the
+            # GPU before the next request takes the arena again.
+            stagings = self._load_arena.take([t.numel() * t.element_size() for t in templates])
+            oks = self._store.load_layers(rm.content_hash, layer_names, stagings, self._load_arena.region)
             if not (len(oks) == len(layer_names) and all(oks)):
                 # FAIL-CLOSED (BUG-KVC-LOAD-ATOMIC). This request was admitted
                 # because the scheduler saw the `__present__` marker, so every
@@ -977,6 +1002,8 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         path: (1) wait for the GPU gathers, (2) store-dedup, (3) D2H copy, (4)
         durable put_from, (5) marker iff every layer ACKed. The GPU tensors in
         `layers` stay alive because this frame holds them; freed on return."""
+        import torch
+
         try:
             if gather_event is not None:
                 gather_event.synchronize()  # CPU-wait (this bg thread) for the gathers
@@ -986,9 +1013,12 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 log.debug("skip save req=%s: prefix already present in autumn", req_id)
                 return
             names = [ln for (ln, _t) in layers]
-            cpu_tensors = [t.detach().cpu() for (_ln, t) in layers]  # the D2H copy, now in the background
-            views = [_byte_view(t) for t in cpu_tensors]
-            oks = self._store.save_layers(content_hash, names, views)
+            # The D2H copy, now in the background, into the save arena (one save
+            # thread owns it; put_from returns only once nothing reads it).
+            views = self._save_arena.take([t.numel() * t.element_size() for (_ln, t) in layers])
+            for view, (_ln, t) in zip(views, layers):
+                torch.from_numpy(view).view(t.dtype).reshape(t.shape).copy_(t.detach())
+            oks = self._store.save_layers(content_hash, names, views, self._save_arena.region)
             if oks and all(oks):
                 self._store.mark_present(content_hash)
             else:

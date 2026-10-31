@@ -36,7 +36,8 @@ KEY_NAMESPACE = "kvc"
 # INVARIANT — BUMP THIS whenever the connector's saved KV byte layout or key
 # scheme changes. Concretely: any change to `vllm_connector._extract_layer` /
 # `_inject_layer` (the serialize/deserialize pair — e.g. the 2026-06-22
-# K/V-dim-order fix), to `_byte_view`, or to how keys are composed. Changing
+# K/V-dim-order fix), to the save's byte copy (`_run_save_job`: the tensor's
+# contiguous bytes), or to how keys are composed. Changing
 # that layout WITHOUT bumping = same failure class as two models sharing one
 # scope: shapes may still line up, nothing errors, output is silently garbage.
 # `test_model_identity.py` pins the current value so a bump is always a

@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from autumn_kvcache.vllm_connector import AutumnKVConnector, align_to_block_size
+import autumn_kvcache.vllm_connector as vc_mod  # noqa: E402
 
 
 def _torch():
@@ -47,7 +48,7 @@ class _FakeStore:
         self.probes += 1
         return self._present
 
-    def save_layers(self, chash: str, names, views) -> list:
+    def save_layers(self, chash: str, names, views, region=None) -> list:
         if self._save_gate is not None:
             self._save_gate.wait()
         self.saved.append((chash, list(names)))
@@ -75,6 +76,7 @@ def _mk(present=False, save_gate=None) -> AutumnKVConnector:
     c._save_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-save")
     c._inflight_lock = threading.Lock()
     c._inflight_saves = 0
+    c._save_arena = vc_mod._Arena()
     return c
 
 

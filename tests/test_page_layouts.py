@@ -124,17 +124,19 @@ class FakeStore:
     """put_from / get_into on bytes, batch_head on presence; records every buffer."""
 
     def __init__(self):
-        self.data, self.put_bufs, self.get_bufs = {}, [], []
+        self.data, self.put_bufs, self.get_bufs, self.regions = {}, [], [], []
         self.exists_calls = self.head_calls = 0
 
-    def put_from(self, keys, bufs, ttl_secs=0):
+    def put_from(self, keys, bufs, ttl_secs=0, region=None):
         self.put_bufs += bufs
+        self.regions.append(region)
         for k, b in zip(keys, bufs):
             self.data[bytes(k)] = bytes(np.asarray(b))
         return [True] * len(keys)
 
-    def get_into(self, keys, bufs):
+    def get_into(self, keys, bufs, region=None):
         self.get_bufs += bufs
+        self.regions.append(region)
         out = []
         for k, b in zip(keys, bufs):
             v = self.data.get(bytes(k))
@@ -312,3 +314,53 @@ def test_presence_falls_back_to_batch_head_without_exists():
     assert all(b.batch_set_v1(HASHES, indices(STARTS)))
     assert b.batch_exists(HASHES) == len(HASHES)
     assert store.head_calls >= 2
+
+
+class Registered:
+    """What `autumn.register` was given."""
+
+    def __init__(self, buf):
+        a = np.asarray(buf)
+        self.start, self.end = a.__array_interface__["data"][0], a.__array_interface__["data"][0] + a.nbytes
+
+    def holds(self, buf):
+        a = np.asarray(buf)
+        p = a.__array_interface__["data"][0]
+        return self.start <= p and p + a.nbytes <= self.end
+
+
+class RegionStore(FakeStore):
+    """Records each call's buffers with the region passed for them."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def put_from(self, keys, bufs, ttl_secs=0, region=None):
+        self.calls.append(("put", list(bufs), region))
+        return super().put_from(keys, bufs, ttl_secs, region)
+
+    def get_into(self, keys, bufs, region=None):
+        self.calls.append(("get", list(bufs), region))
+        return super().get_into(keys, bufs, region)
+
+
+@pytest.mark.parametrize("make,kind", POOLS)
+def test_pages_move_with_the_registration_that_holds_them(make, kind, monkeypatch):
+    """Over UCX a buffer outside a registered region is copied through
+    autumn's pool: every page buffer goes with a region that holds it — the
+    pool's storage, or the scratch for `copy` pages. Only a pool with no page
+    axis (Mamba-like), whose pages are assembled copies, writes unregistered."""
+    import autumn_kvcache.sglang_backend as sb
+
+    monkeypatch.setattr(sb.autumn, "register", Registered)
+    store, src, dst = RegionStore(), make(), make()
+    fill(src, 4)
+    assert all(backend(store, src).batch_set_v1(HASHES, indices(STARTS)))
+    assert all(backend(store, dst).batch_get_v1(HASHES, indices(STARTS)))
+    assert store.calls
+    for verb, bufs, region in store.calls:
+        if region is None:
+            assert (verb, kind, make) == ("put", _PageCodec.COPY, CatPool), f"{verb} without a region"
+            continue
+        assert all(region.holds(b) for b in bufs), f"{verb}: a buffer outside its region"
