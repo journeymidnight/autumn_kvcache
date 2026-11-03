@@ -12,6 +12,7 @@ No cluster: the storage clients are in-memory fakes.
 from __future__ import annotations
 
 import types
+from enum import Enum
 
 import numpy as np
 import pytest
@@ -260,6 +261,25 @@ def test_v2_transfers_land_in_the_named_pool():
     assert all(reader._batch_v2([t], reader._get_pages, "get")["kv"])
     for s in STARTS:
         assert torch.equal(page_bytes(dst, s), page_bytes(src, s))
+
+
+class PoolName(str, Enum):  # as sglang's hicache_storage.PoolName
+    KV = "kv"
+    MAMBA = "mamba"
+
+
+def test_an_enum_pool_name_is_stored_and_reported_by_its_value():
+    # From Python 3.11 str(PoolName.MAMBA) is "PoolName.MAMBA": keys went under
+    # that segment and sglang's results.get(PoolName.MAMBA) found nothing.
+    store, src, dst = FakeStore(), MHAPool("layer_first"), MHAPool("layer_first")
+    fill(src, 6)
+    writer, reader = backend(store, None), backend(store, None)
+    writer.registered_pools, reader.registered_pools = {PoolName.MAMBA: src}, {PoolName.MAMBA: dst}
+    t = types.SimpleNamespace(name=PoolName.MAMBA, keys=HASHES, host_indices=indices(STARTS))
+    assert all(writer._batch_v2([t], writer._put_pages, "set").get(PoolName.MAMBA, []))
+    assert all(reader._batch_v2([t], reader._get_pages, "get").get(PoolName.MAMBA, []))
+    assert store.data and all(b"/mamba/" in k for k in store.data)
+    assert reader._pool_prefix_flags(PoolName.MAMBA, HASHES) == [True] * len(HASHES)
 
 
 @pytest.mark.parametrize("make,kind", POOLS)

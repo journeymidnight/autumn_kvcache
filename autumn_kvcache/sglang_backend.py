@@ -142,6 +142,13 @@ log = logging.getLogger(__name__)
 DEFAULT_POOL_NAME = "kv"
 
 
+def _pool_segment(name) -> str:
+    """A pool's name as stored and reported: its value ("kv", "mamba").
+    sglang names pools with `PoolName(str, Enum)` members, whose `str()` is
+    "PoolName.MAMBA" from Python 3.11 on."""
+    return str(getattr(name, "value", name))
+
+
 def _normalize_indices(host_indices) -> List[int]:
     """Accept torch.Tensor, numpy array, list, or any iterable of ints."""
     if hasattr(host_indices, "tolist"):
@@ -490,7 +497,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self._codec(mem_pool_host)
 
     def _full_key(self, hash_str: str, pool_name: str = DEFAULT_POOL_NAME) -> bytes:
-        return full_key(self._model_scope, hash_str, pool_name)
+        return full_key(self._model_scope, hash_str, _pool_segment(pool_name))
 
     def _codec(self, pool) -> _PageCodec:
         codecs = self.__dict__.setdefault("_codecs", {})
@@ -665,7 +672,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     #
     # The key schema already anticipated this: `full_key(model_scope, hash, pool)`
     # puts the pool in its own path segment, and the KV pool's segment is "kv",
-    # which is what `PoolName.KV` stringifies to. So v2 keys for the KV pool are
+    # `PoolName.KV`'s value (`_pool_segment`). So v2 keys for the KV pool are
     # byte-identical to v1's — this is additive, not a migration.
 
     def _pool_for(self, pool_name):
@@ -680,7 +687,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         """
         pools = getattr(self, "registered_pools", None) or {}
         pool = pools.get(pool_name)
-        if pool is None and str(pool_name) == DEFAULT_POOL_NAME:
+        if pool is None and _pool_segment(pool_name) == DEFAULT_POOL_NAME:
             pool = self._mem_pool_host
         if pool is None:
             raise RuntimeError(
@@ -715,13 +722,13 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             raise NotImplementedError("sglang v2 pool types unavailable")
 
         kv_pages = self.batch_exists(keys, extra_info)
-        hit_count = {str(PoolName.KV): kv_pages} if kv_pages else {}
+        hit_count = {DEFAULT_POOL_NAME: kv_pages} if kv_pages else {}
         final_pages = kv_pages
 
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
-            name = str(transfer.name)
+            name = _pool_segment(transfer.name)
             try:
                 present = self._pool_prefix_flags(name, keys[:kv_pages])
             except Exception as e:  # noqa: BLE001
@@ -773,7 +780,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         """
         results = {}
         for t in transfers or []:
-            name = str(t.name)
+            name = _pool_segment(t.name)
             t_keys = list(t.keys or [])
             if not t_keys:
                 results[name] = []
