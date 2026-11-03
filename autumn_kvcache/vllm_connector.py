@@ -45,20 +45,23 @@ log = logging.getLogger(__name__)
 # Separate keyspace pool segment from sglang's "kv" (docs §13.3).
 VLLM_POOL_NAME = "vllm"
 
-# Async save (off the prefill critical path). save_kv_layer gathers each layer
-# GPU→CPU synchronously (that copy is what frees the GPU blocks), but the slow
-# durable put_from runs on a background thread and the presence marker is
-# published only after it ACKs. At most this many requests' saves may be
-# in-flight at once — each pins ~one prompt's worth of CPU KV (hundreds of MB),
-# so the bound caps memory; over it, a save is DROPPED (the prefix just isn't
+# Async save (off the prefill critical path). save_kv_layer gathers the tokens
+# each step computes into a standalone GPU tensor (decoupled from the paged
+# blocks); a background thread copies them into the prefix's host buffer and,
+# with its last tokens, does the durable put_from, publishing the presence
+# marker only after it ACKs. At most this many prefixes may be in flight, from
+# their first step to their write; each holds a registered host buffer the size
+# of its whole prefix's KV (buffers are kept and grow to the longest prefix:
+# 2 × max_model_len × per-token KV at most; one 17K-token Qwen3-VL-4B prompt
+# is ~2.3 GiB). Over the cap a save is DROPPED (the prefix just isn't
 # cached and a later request re-saves — a pure cache, safe to skip) rather than
-# blocking prefill again.
+# blocking prefill.
 _MAX_INFLIGHT_SAVES = 2
 
 # The connector's own KV-layout / storage-format version. Moved to `_keys.py`
 # (pure, offline-testable + pinned by test_model_identity.py) — it is baked
 # into every key path AND the model fingerprint. BUMP it whenever
-# `_extract_layer` / `_inject_layer` / the save's byte copy (`_run_save_job`) /
+# `_extract_layer` / `_inject_layer` / the save's byte copy (`_save_chunk`) /
 # the key scheme changes;
 # see the invariant comment at its definition.
 _KV_STORAGE_FORMAT = VLLM_KV_STORAGE_FORMAT
@@ -92,6 +95,24 @@ _TTL_LAYER_GRACE_SECS = 300
 # can never exceed u64 and make the LAYER write fail while the marker (smaller
 # TTL) still succeeds. Mirrors the Rust helper's `saturating_add`.
 _U64_MAX = (1 << 64) - 1
+
+# The partition server refuses a value over 64 MiB (autumn-rs
+# AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT). A layer above it is stored as equal
+# pieces under `{layer}/{i}`; one within it keeps the plain `{layer}` key, so
+# what was stored before still reads. Changing it changes the key scheme: bump
+# VLLM_KV_STORAGE_FORMAT.
+_MAX_VALUE_BYTES = 64 << 20
+
+
+def _split(layer_name: str, view: Any) -> List[tuple]:
+    """(key suffix, byte view) pieces of one layer's value, none over
+    `_MAX_VALUE_BYTES`; both sides derive them from the layer's size."""
+    n = len(view)
+    k = -(-n // _MAX_VALUE_BYTES)
+    if k <= 1:
+        return [(layer_name, view)]
+    step = -(-n // k)
+    return [(f"{layer_name}/{i}", view[i * step : (i + 1) * step]) for i in range(k)]
 
 # ── defensive vLLM import ────────────────────────────────────────────────────
 # Module must import without vLLM installed (data-plane smoke test + tooling).
@@ -370,30 +391,48 @@ class _AutumnKVStore:
         """Scheduler-side existence probe — layer-name independent."""
         return self.exists(content_hash, self.PRESENT_MARKER)
 
-    def save_layers(self, content_hash: str, layer_names: List[str], views: List[Any], region=None) -> List[bool]:
-        """Batched zero-copy put of one page per (content_hash, layer).
+    def _pieces(self, content_hash: str, layer_names: List[str], bufs: List[Any]):
+        """Keys and byte views of every piece, and how many each layer has."""
+        keys, views, counts = [], [], []
+        for ln, buf in zip(layer_names, bufs):
+            pieces = _split(ln, buf)
+            keys.extend(self._key(content_hash, suffix) for suffix, _ in pieces)
+            views.extend(v for _, v in pieces)
+            counts.append(len(pieces))
+        return keys, views, counts
 
-        `views` are buffer-protocol objects (numpy uint8 / torch byte view);
+    @staticmethod
+    def _per_layer(oks: List[bool], counts: List[int]) -> List[bool]:
+        out, at = [], 0
+        for c in counts:
+            out.append(len(oks) >= at + c and all(oks[at : at + c]))
+            at += c
+        return out
+
+    def save_layers(self, content_hash: str, layer_names: List[str], views: List[Any], region=None) -> List[bool]:
+        """Batched zero-copy put of each layer's value, one bool per layer.
+
+        `views` are 1-D byte views (numpy uint8 / torch uint8);
         len(views) == len(layer_names). Over UCX, views inside `region` (an
         `autumn.register` result) are sent from where they are; others are
         copied through autumn's pool first.
         """
-        keys = [self._key(content_hash, ln) for ln in layer_names]
+        keys, pieces, counts = self._pieces(content_hash, layer_names, views)
         try:
-            return list(self._batch.put_from(keys, views, self._layer_ttl, region))
+            return self._per_layer(list(self._batch.put_from(keys, pieces, self._layer_ttl, region)), counts)
         except Exception as e:  # noqa: BLE001
             log.debug("save_layers put_from error (n=%d): %r", len(keys), e)
-            return [False] * len(keys)
+            return [False] * len(layer_names)
 
     def load_layers(self, content_hash: str, layer_names: List[str], dests: List[Any], region=None) -> List[bool]:
-        """Batched get into per-layer destination buffers; over UCX, dests
-        inside `region` receive with no copy (as `save_layers`)."""
-        keys = [self._key(content_hash, ln) for ln in layer_names]
+        """Batched get into per-layer destination buffers, one bool per layer;
+        over UCX, dests inside `region` receive with no copy (as `save_layers`)."""
+        keys, pieces, counts = self._pieces(content_hash, layer_names, dests)
         try:
-            return list(self._batch.get_into(keys, dests, region))
+            return self._per_layer(list(self._batch.get_into(keys, pieces, region)), counts)
         except Exception as e:  # noqa: BLE001
             log.debug("load_layers get_into error (n=%d): %r", len(keys), e)
-            return [False] * len(keys)
+            return [False] * len(layer_names)
 
 
 # ── connector metadata ───────────────────────────────────────────────────────
@@ -402,14 +441,17 @@ class _AutumnKVStore:
 class _ReqMeta:
     req_id: str
     content_hash: str
-    # Flattened slot indices (block_id*block_size + offset) for this request's
-    # full block-aligned prefix; used to gather/scatter the paged KV tensor.
+    # Flattened slot indices (block_id*block_size + offset): a load's cover
+    # the whole block-aligned prefix, a store's the tokens of it this step
+    # computes, from token `start` of `total`.
     slot_mapping: Any  # torch.Tensor at runtime
     is_store: bool
     # The vLLM block-pool ids backing slot_mapping. Kept so a fail-closed load
     # (BUG-KVC-LOAD-ATOMIC) can report exactly these blocks via
     # get_block_ids_with_load_errors() → vLLM re-runs normal prefill for them.
     block_ids: List[int] = field(default_factory=list)
+    start: int = 0
+    total: int = 0
 
 
 @dataclass
@@ -425,9 +467,11 @@ class AutumnConnectorMetadata(KVConnectorMetadata):  # type: ignore[misc]
         slot_mapping: Any,
         is_store: bool,
         block_ids: Optional[List[int]] = None,
+        start: int = 0,
+        total: int = 0,
     ) -> None:
         self.requests.append(
-            _ReqMeta(req_id, content_hash, slot_mapping, is_store, list(block_ids or []))
+            _ReqMeta(req_id, content_hash, slot_mapping, is_store, list(block_ids or []), start, total)
         )
 
 
@@ -439,6 +483,16 @@ class AutumnWorkerMetadata(KVConnectorWorkerMetadata):  # type: ignore[misc]
 
     def aggregate(self, other: "AutumnWorkerMetadata") -> "AutumnWorkerMetadata":
         return AutumnWorkerMetadata(self.failed_hashes | other.failed_hashes)
+
+
+@dataclass
+class _PendingStore:
+    """Scheduler side: a prefix saved over the steps that compute it."""
+
+    content_hash: str
+    total: int  # tokens
+    block_ids: List[int]
+    saved: int = 0  # tokens handed to the worker so far
 
 
 # ── torch helpers (worker side, vLLM runtime only) ──────────────────────────
@@ -663,6 +717,8 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         self._reqs_need_load: dict = {}
         # req_id -> block ids recorded at alloc time (authoritative for load).
         self._alloc_blocks: dict = {}
+        # req_id -> _PendingStore: prefixes being saved, until their last token.
+        self._pending_stores: dict = {}
         # worker-side state.
         self._kv_caches: dict = {}
         self._layer_order: List[str] = []
@@ -677,15 +733,19 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # build_connector_worker_meta.
         self._failed_hashes: set = set()
         # Async save (see _MAX_INFLIGHT_SAVES). save_kv_layer only does the cheap
-        # GPU-side gather (`_extract_layer` → a standalone tensor) and accumulates
-        # it here (req_id -> [(layer_name, gpu_tensor)]); wait_for_save hands a
-        # full set to one background thread that does the EXPENSIVE work off the
-        # prefill critical path: the D2H `.cpu()` copy, the store-dedup probe, the
-        # durable put_from, and the marker. One worker thread: put_from hands the
-        # whole batch to the BatchClient's worker.
+        # GPU-side gather (`_extract_layer` → a standalone tensor) of the tokens
+        # this step computed and accumulates it here
+        # (req_id -> [(layer_name, gpu_tensor)]); wait_for_save hands each
+        # step's set to one background thread that does the EXPENSIVE work off
+        # the prefill critical path: the store-dedup probe, the D2H copy into
+        # the prefix's host buffer and, with the last tokens, the durable
+        # put_from and the marker. One worker thread: put_from hands the whole
+        # batch to the BatchClient's worker.
         self._pending_saves: dict = {}
+        self._save_jobs: dict = {}  # req_id -> _SaveJob not yet given its last tokens
         self._save_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autumn-kvc-save")
-        self._save_arena = _Arena()  # the save thread's
+        # One host buffer per in-flight save, used by the save thread.
+        self._free_arenas = [_Arena() for _ in range(_MAX_INFLIGHT_SAVES)]
         self._load_arena = _Arena()  # the forward thread's (start_load_kv)
         self._inflight_lock = threading.Lock()
         self._inflight_saves = 0
@@ -736,43 +796,94 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # identical cold-prefix request — without this per-batch set they'd all
         # be scheduled to save the same KV (concurrent write amplification).
         scheduled_stores: set = set()
+        num_scheduled = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+
+        def load(req_id, block_ids):
+            chash, num_tokens = self._reqs_need_load.pop(req_id)
+            slots = _slot_mapping_for_blocks(block_ids, self._block_size, num_tokens)
+            # Guard: never load into an empty slot mapping — we could not
+            # resolve real block ids for this request.
+            if _slot_len(slots) == 0:
+                log.warning(
+                    "skip load req=%s: empty slot_mapping (num_tokens=%d, blocks=%d)",
+                    req_id, num_tokens, len(block_ids),
+                )
+                return
+            meta.add(req_id, chash, slots, is_store=False, block_ids=block_ids)
+
+        # A prefix is saved in the steps that compute it: each step's store
+        # covers the tokens it adds, so what a step gathers stays within vLLM's
+        # token budget however long the prompt (a chunked prefill computes one
+        # over several steps and is given its blocks as it goes).
+        def store(req_id, ps, done):
+            done = min(done, ps.total)
+            if done <= ps.saved:
+                return
+            slots = _slot_mapping_for_blocks(ps.block_ids, self._block_size, done)[ps.saved:]
+            if _slot_len(slots) != done - ps.saved:
+                log.warning(
+                    "skip store req=%s: blocks cover %d of tokens %d..%d",
+                    req_id, _slot_len(slots), ps.saved, done,
+                )
+                del self._pending_stores[req_id]
+                return
+            meta.add(req_id, ps.content_hash, slots, is_store=True, block_ids=ps.block_ids,
+                     start=ps.saved, total=ps.total)
+            ps.saved = done
+            if done == ps.total:
+                del self._pending_stores[req_id]
+
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        for i, req_id in enumerate(getattr(cached, "req_ids", None) or []):
+            resumed = req_id in cached.resumed_req_ids
+            new_ids = _flatten_block_ids(cached.new_block_ids[i])
+            if resumed:
+                self._alloc_blocks.pop(req_id, None)
+                # A preempted request is probed again when it resumes; its
+                # blocks are all new.
+                if req_id in self._reqs_need_load:
+                    self._pending_stores.pop(req_id, None)
+                    load(req_id, new_ids)
+                    continue
+            ps = self._pending_stores.get(req_id)
+            if ps is None:
+                continue
+            if resumed:
+                ps.block_ids = new_ids
+            else:
+                ps.block_ids.extend(new_ids)
+            store(req_id, ps, cached.num_computed_tokens[i] + num_scheduled.get(req_id, 0))
+
         for new_req in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
             req_id = _req_id(new_req)
             # Prefer alloc-time block ids; fall back to the new-req's own field.
             block_ids = self._alloc_blocks.pop(req_id, None)
             if not block_ids:
                 block_ids = _flatten_block_ids(getattr(new_req, "block_ids", None))
-            token_ids = list(getattr(new_req, "prompt_token_ids", []) or [])
-
             if req_id in self._reqs_need_load:
-                chash, num_tokens = self._reqs_need_load.pop(req_id)
-                is_store = False
+                self._pending_stores.pop(req_id, None)
+                load(req_id, block_ids)
+                continue
+            ps = self._pending_stores.get(req_id)
+            if ps is not None:
+                # Resumed after preemption: the v2 model runner sends it as new.
+                ps.block_ids = list(block_ids)
             else:
+                token_ids = list(getattr(new_req, "prompt_token_ids", []) or [])
                 num_tokens = align_to_block_size(max(0, len(token_ids) - 1), self._block_size)
                 if num_tokens <= 0:
                     continue
                 chash = prefix_hash(token_ids, num_tokens, _request_extra_keys(new_req))
-                # The real store-dedup (skip if already durable in autumn) runs in
-                # the background save job so the scheduler pays no probe here
+                # The real store-dedup (skip if already durable in autumn) runs
+                # in the background save job so the scheduler pays no probe here
                 # (BUG-KVC-NO-HIT). The only scheduler-side check is this cheap
                 # per-batch guard: don't GPU-gather the SAME prefix twice in one
                 # batch (identical concurrent cold prompts).
                 if chash in scheduled_stores:
                     continue
                 scheduled_stores.add(chash)
-                is_store = True
-
-            slots = _slot_mapping_for_blocks(block_ids, self._block_size, num_tokens)
-            # Guard: never save/load empty KV. An empty slot mapping means we
-            # could not resolve real block ids for this request — skip it loudly
-            # rather than silently persisting/restoring zero bytes.
-            if _slot_len(slots) == 0:
-                log.warning(
-                    "skip req=%s (%s): empty slot_mapping (num_tokens=%d, blocks=%d)",
-                    req_id, "store" if is_store else "load", num_tokens, len(block_ids),
-                )
-                continue
-            meta.add(req_id, chash, slots, is_store=is_store, block_ids=block_ids)
+                ps = self._pending_stores[req_id] = _PendingStore(chash, num_tokens, list(block_ids))
+            store(req_id, ps, getattr(new_req, "num_computed_tokens", 0) + num_scheduled.get(req_id, 0))
         return meta
 
     def update_connector_output(self, connector_output: Any) -> None:
@@ -795,6 +906,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # request aborted while queued) so the map can't grow unbounded and a
         # stale _reqs_need_load entry can't bind a later id to this content_hash.
         self._reqs_need_load.pop(rid, None)
+        self._pending_stores.pop(rid, None)
         return False, None
 
     # ── worker side ─────────────────────────────────────────────────────────
@@ -844,6 +956,9 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         for rm in meta.requests:
             if rm.is_store:
                 continue
+            # Resumed after preemption with the prefix found remote: it is
+            # loaded, so its own save will not be finished.
+            self._end_save(rm.req_id)
             if _slot_len(rm.slot_mapping) == 0:
                 continue
             if rm.content_hash in failed_hashes:
@@ -933,6 +1048,8 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         for rm in meta.requests:
             if not rm.is_store:
                 continue
+            if rm.start > 0 and not self._saving(rm.req_id):
+                continue  # its save was dropped or ended
             # GPU-side gather ONLY. `_extract_layer` advanced-indexes + .contiguous()
             # → a STANDALONE GPU tensor holding this request's KV, decoupled from
             # the paged blocks (so the blocks are free to be reused). This op is
@@ -941,9 +1058,10 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             #
             # These standalone tensors are held until the background job's D2H
             # runs, so they are transient GPU staging. Peak is bounded per step by
-            # vLLM's own token budget (the store reqs in a step are the new
-            # prefills it scheduled, ≤ max_num_batched_tokens × per-token KV), so
-            # it does not grow with prompt length or QPS. A same-instance repeat
+            # vLLM's own token budget (a store covers the tokens its step
+            # computes, ≤ max_num_batched_tokens × per-token KV; a first step also
+            # covers the tokens a local prefix-cache hit skipped), so it does not
+            # grow with prompt length or QPS. A same-instance repeat
             # (local prefix cache already served it) still gathers here — cheap,
             # no D2H — and the background dedup then skips the actual write; that
             # is the ~6 ms no-hit overhead, not the 20 GB write amplification.
@@ -951,10 +1069,11 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             self._pending_saves.setdefault(rm.req_id, []).append((layer_name, gathered_gpu))
 
     def wait_for_save(self) -> None:
-        # Hand each fully-gathered store req to ONE background job that does the
-        # D2H copy + dedup probe + durable put_from + marker — all off the prefill
-        # critical path. A CUDA event marks completion of the GPU gathers so the
-        # background thread waits for them before the D2H. Non-blocking here.
+        # Hand each store's gathered layers to the background thread, which
+        # copies them into the prefix's host buffer and, with the prefix's last
+        # tokens, writes it — all off the prefill critical path. A CUDA event
+        # marks completion of the GPU gathers so the background thread waits
+        # for them before the D2H. Non-blocking here.
         import torch
 
         meta = self._meta
@@ -962,77 +1081,139 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             return
         expected = len(self._kv_caches)
         for rm in meta.requests:
-            if not (rm.is_store and _slot_len(rm.slot_mapping) > 0):
+            n = _slot_len(rm.slot_mapping)
+            if not (rm.is_store and n > 0):
                 continue
             layers = self._pending_saves.pop(rm.req_id, [])
-            # Only a fully-gathered prefix is eligible; `expected == 0` (no
+            if rm.start == 0:
+                self._end_save(rm.req_id)
+                if not self._begin_save(rm):
+                    continue
+            if not self._saving(rm.req_id):
+                self._save_jobs.pop(rm.req_id, None)
+                continue  # dropped at its first tokens, or ended
+            job = self._save_jobs[rm.req_id]
+            # Only a fully-gathered step is eligible; `expected == 0` (no
             # kv_caches registered) also withholds — never mark a partial prefix.
             if not (expected > 0 and len(layers) == expected):
                 log.warning(
                     "withholding save req=%s: gathered %d/%d layers",
                     rm.req_id, len(layers), expected,
                 )
+                self._end_save(rm.req_id)
                 continue
-            # Backpressure: cap the in-flight saves so the held GPU staging can't
-            # grow without bound; over the cap, drop (a later request re-saves —
-            # pure cache) rather than block prefill. The gather itself is already
-            # bounded per step by vLLM's token budget (max_num_batched_tokens ×
-            # per-token KV), so the peak GPU staging is bounded even though the
-            # cap is checked here (after the gather); see note in save_kv_layer.
-            with self._inflight_lock:
-                if self._inflight_saves >= _MAX_INFLIGHT_SAVES:
-                    log.debug("async save dropped req=%s: %d in-flight",
-                              rm.req_id, self._inflight_saves)
-                    continue  # `layers` (GPU tensors) free on continue
-                self._inflight_saves += 1
+            last = rm.start + n >= rm.total
             try:
                 ev = torch.cuda.Event()
-                ev.record()  # completion of this req's GPU gathers on the model stream
-                self._save_pool.submit(self._run_save_job, rm.req_id, rm.content_hash, layers, ev)
-            except Exception as e:  # noqa: BLE001 — roll back the reservation on any
-                # event/record/submit failure so a stuck counter can't wedge ALL
-                # future saves (they'd all trip the cap above forever).
-                with self._inflight_lock:
-                    self._inflight_saves -= 1
+                ev.record()  # completion of this step's GPU gathers on the model stream
+                self._save_pool.submit(self._save_chunk, job, rm.start, layers, ev, last)
+            except Exception as e:  # noqa: BLE001 — release it here: the pool may be gone
                 log.warning("async save submit failed req=%s: %r", rm.req_id, e)
+                self._release_save(self._save_jobs.pop(rm.req_id))
+                continue
+            if last:
+                del self._save_jobs[rm.req_id]
         self._pending_saves = {}
 
-    def _run_save_job(self, req_id: Any, content_hash: str, layers: list, gather_event: Any) -> None:
+    def _begin_save(self, rm: _ReqMeta) -> bool:
+        """Reserve one of the in-flight saves for a prefix. Over the cap the
+        save is dropped (a later request re-saves — pure cache) rather than
+        blocking prefill: each holds a host buffer the size of its prefix."""
+        with self._inflight_lock:
+            if self._inflight_saves >= _MAX_INFLIGHT_SAVES:
+                log.debug("async save dropped req=%s: %d in-flight", rm.req_id, self._inflight_saves)
+                return False
+            self._inflight_saves += 1
+            arena = self._free_arenas.pop()
+        self._save_jobs[rm.req_id] = _SaveJob(rm.content_hash, rm.total, arena)
+        return True
+
+    def _saving(self, req_id: Any) -> bool:
+        """Whether `req_id` has a save still taking its tokens; the save
+        thread releases one that found its prefix present or failed."""
+        job = self._save_jobs.get(req_id)
+        return job is not None and not job.released
+
+    def _end_save(self, req_id: Any) -> None:
+        """Abandon a save that will not get its last tokens; released after
+        the steps already queued for it."""
+        job = self._save_jobs.pop(req_id, None)
+        if job is not None:
+            self._save_pool.submit(self._release_save, job)
+
+    def _release_save(self, job: "_SaveJob") -> None:
+        with self._inflight_lock:
+            if job.released:
+                return
+            job.released = True
+            self._inflight_saves -= 1
+            self._free_arenas.append(job.arena)
+
+    def _save_chunk(self, job: "_SaveJob", start: int, layers: list, gather_event: Any, last: bool) -> None:
         """Background thread — everything expensive lives here, NOT on the prefill
-        path: (1) wait for the GPU gathers, (2) store-dedup, (3) D2H copy, (4)
-        durable put_from, (5) marker iff every layer ACKed. The GPU tensors in
-        `layers` stay alive because this frame holds them; freed on return."""
+        path: (1) wait for the GPU gathers, (2) store-dedup at the prefix's first
+        tokens, (3) D2H copy into the prefix's host buffer, and with its last
+        tokens (4) durable put_from, (5) marker iff every layer ACKed. The GPU
+        tensors in `layers` stay alive because this frame holds them; freed on
+        return. Each layer's tokens land at `start`: the buffer holds what one
+        gather of the whole prefix would."""
         import torch
 
         try:
+            if job.released:
+                return
             if gather_event is not None:
                 gather_event.synchronize()  # CPU-wait (this bg thread) for the gathers
-            # Store-dedup (BUG-KVC-NO-HIT), off the critical path: a prefix already
-            # durable in autumn is neither re-copied nor re-written.
-            if self._store.is_present(content_hash):
-                log.debug("skip save req=%s: prefix already present in autumn", req_id)
+            if job.views is None:
+                # Store-dedup (BUG-KVC-NO-HIT), off the critical path: a prefix
+                # already durable in autumn is neither re-copied nor re-written.
+                if self._store.is_present(job.content_hash):
+                    log.debug("skip save of %s: prefix already present in autumn", job.content_hash)
+                    self._release_save(job)
+                    return
+                job.names = [ln for (ln, _t) in layers]
+                per_token = [t.numel() * t.element_size() // t.shape[0] for (_ln, t) in layers]
+                job.views = job.arena.take([job.total * b for b in per_token])
+            for view, (_ln, t) in zip(job.views, layers):
+                b = len(view) // job.total
+                part = view[start * b : (start + t.shape[0]) * b]
+                torch.from_numpy(part).view(t.dtype).reshape(t.shape).copy_(t.detach())
+            if not last:
                 return
-            names = [ln for (ln, _t) in layers]
-            # The D2H copy, now in the background, into the save arena (one save
-            # thread owns it; put_from returns only once nothing reads it).
-            views = self._save_arena.take([t.numel() * t.element_size() for (_ln, t) in layers])
-            for view, (_ln, t) in zip(views, layers):
-                torch.from_numpy(view).view(t.dtype).reshape(t.shape).copy_(t.detach())
-            oks = self._store.save_layers(content_hash, names, views, self._save_arena.region)
+            oks = self._store.save_layers(job.content_hash, job.names, job.views, job.arena.region)
             if oks and all(oks):
-                self._store.mark_present(content_hash)
+                self._store.mark_present(job.content_hash)
             else:
                 n_ok = sum(1 for o in oks if o) if oks else 0
-                log.warning("async save incomplete req=%s: %d/%d layers ok", req_id, n_ok, len(names))
+                log.warning("async save incomplete for %s: %d/%d layers ok", job.content_hash, n_ok, len(job.names))
         except Exception as e:  # noqa: BLE001 — a background write must never crash the thread
-            log.warning("async save failed req=%s: %r", req_id, e)
+            log.warning("async save failed for %s: %r", job.content_hash, e)
+            self._release_save(job)
         finally:
-            with self._inflight_lock:
-                self._inflight_saves -= 1
+            if last:
+                self._release_save(job)
 
     def get_finished(self, finished_req_ids: set):
+        # A request that ended before its prefix's last token (aborted, or
+        # stopped mid-prefill) never completes its save.
+        for rid in finished_req_ids or ():
+            self._end_save(rid)
         # No async send/recv in Phase 3a.
         return None, None
+
+
+class _SaveJob:
+    """Worker side: one prefix's save, filled over the steps that compute it."""
+
+    def __init__(self, content_hash: str, total: int, arena: "_Arena"):
+        self.content_hash = content_hash
+        self.total = total  # tokens
+        self.arena = arena
+        self.names: Optional[List[str]] = None
+        self.views: Optional[list] = None  # per layer, the whole prefix's bytes
+        # Set on the save thread once its reservation and buffer are given
+        # back: the prefix was found present, the save failed or ended.
+        self.released = False
 
 
 # ── vllm_config → model-scope cfg shim ───────────────────────────────────────

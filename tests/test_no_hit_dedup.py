@@ -70,13 +70,15 @@ def _mk(present=False, save_gate=None) -> AutumnKVConnector:
     c._store = _FakeStore(present, save_gate)
     c._reqs_need_load = {}
     c._alloc_blocks = {}
+    c._pending_stores = {}
     c._kv_caches = {}
     c._meta = None
     c._pending_saves = {}
     c._save_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-save")
     c._inflight_lock = threading.Lock()
     c._inflight_saves = 0
-    c._save_arena = vc_mod._Arena()
+    c._save_jobs = {}
+    c._free_arenas = [vc_mod._Arena()]
     return c
 
 
@@ -86,11 +88,16 @@ def _req(rid: str, n_tokens: int):
         request_id=rid,
         prompt_token_ids=list(range(n_tokens)),
         block_ids=[list(range(n_blocks))],
+        num_computed_tokens=0,
     )
 
 
 def _sched(*reqs):
-    return types.SimpleNamespace(scheduled_new_reqs=list(reqs))
+    # Each prompt prefilled in one step.
+    return types.SimpleNamespace(
+        scheduled_new_reqs=list(reqs),
+        num_scheduled_tokens={r.request_id: len(r.prompt_token_ids) for r in reqs},
+    )
 
 
 def _num_check(n_tokens):
@@ -144,9 +151,10 @@ def test_background_job_dedups_then_writes_and_marks():
     torch = _torch()
     c = _mk(present=False)
     c._inflight_saves = 1  # reserved by wait_for_save before submit
+    job = vc_mod._SaveJob("hashA", 16, c._free_arenas.pop())
     layers = [("l0", torch.arange(16, dtype=torch.uint8)),
               ("l1", torch.arange(16, dtype=torch.uint8))]
-    c._run_save_job("a", "hashA", layers, None)
+    c._save_chunk(job, 0, layers, None, True)
     assert c._store.saved == [("hashA", ["l0", "l1"])]
     assert c._store.marked == ["hashA"]   # marker published ONLY after the write
     assert c._inflight_saves == 0
@@ -158,8 +166,9 @@ def test_background_job_skips_when_already_present():
     torch = _torch()
     c = _mk(present=True)
     c._inflight_saves = 1
+    job = vc_mod._SaveJob("hashA", 16, c._free_arenas.pop())
     layers = [("l0", torch.arange(16, dtype=torch.uint8))]
-    c._run_save_job("a", "hashA", layers, None)
+    c._save_chunk(job, 0, layers, None, True)
     assert c._store.saved == [] and c._store.marked == []  # deduped in background
     assert c._inflight_saves == 0                          # reservation still released
 

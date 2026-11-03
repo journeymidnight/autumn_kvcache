@@ -62,6 +62,7 @@ def _mk_connector(oks, block_ids):
     conn._failed_hashes = set()
     conn._store = _FakeStore(oks)
     conn._load_arena = vc._Arena()
+    conn._save_jobs = {}
     meta = vc.AutumnConnectorMetadata()
     meta.add("req-1", "hash-1", list(range(16)), is_store=False, block_ids=block_ids)
     conn._meta = meta

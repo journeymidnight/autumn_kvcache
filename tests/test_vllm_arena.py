@@ -72,10 +72,11 @@ def test_a_save_sends_the_tensors_bytes_from_the_registered_arena():
     c._store = _Store()
     c._inflight_lock = threading.Lock()
     c._inflight_saves = 1
-    c._save_arena = vc._Arena()
+    c._free_arenas = []
+    job = vc._SaveJob("h", 4, vc._Arena())
     layers = [("l0", torch.arange(64, dtype=torch.bfloat16).reshape(4, 16)),
-              ("l1", torch.full((3, 8), 7, dtype=torch.float16))]
-    c._run_save_job("r", "h", layers, None)
+              ("l1", torch.full((4, 8), 7, dtype=torch.float16))]
+    c._save_chunk(job, 0, layers, None, True)
     (data, region, views), = c._store.saved
     assert data == [t.contiguous().view(torch.uint8).numpy().tobytes() for _, t in layers]
-    assert region is c._save_arena.region and all(region.holds(v) for v in views)
+    assert region is job.arena.region and all(region.holds(v) for v in views)

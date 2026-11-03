@@ -139,9 +139,18 @@ TPOT ≈0** vs. no connector — i.e. a prefill that never gets reused costs alm
 nothing. (Before moving the D2H off the path it was +≈148 ms.) When the prefix
 *is* reused cross-instance, the connector skips the whole prefill instead.
 
-At most `_MAX_INFLIGHT_SAVES` saves are in flight (bounding the held GPU/CPU
-staging); over that a save is dropped rather than blocking prefill — it is a pure
-cache, so a later request re-saves. The **store-dedup also lives in the
+A prompt longer than `max_num_batched_tokens` is prefilled in chunks over
+several steps. Each step gathers only the tokens it computed (so the GPU staging
+stays within vLLM's token budget), the background thread copies them into the
+prefix's host buffer, and the prefix is written once its last chunk is in. A
+layer's value larger than the partition server's 64 MiB cap (Qwen3-VL-4B: a
+prefix over 16K tokens) is stored as equal pieces `{layer}/{i}`.
+
+At most `_MAX_INFLIGHT_SAVES` saves are in flight, from a prefix's first chunk to
+its write; each holds a registered host buffer the size of its prefix's KV, and
+the buffers grow to the longest prefix seen (at most 2 × `max_model_len` ×
+per-token KV). Over that a save is dropped rather than blocking prefill — it is
+a pure cache, so a later request re-saves. The **store-dedup also lives in the
 background**: a prefix already durable in autumn is neither re-copied nor
 re-written, so a repeated prompt (served by the local GPU cache) costs no storage
 and no extra latency.
