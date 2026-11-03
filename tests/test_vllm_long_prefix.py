@@ -41,7 +41,8 @@ class _Store:
     def is_present(self, chash):
         return self.present
 
-    def save_layers(self, chash, names, views, region=None):
+    def save_layers(self, chash, names, views, region=None, rank=0):
+        self.rank = rank
         self.saved.append((chash, list(names), [bytes(v) for v in views]))
         return [True] * len(names)
 
@@ -231,6 +232,7 @@ def test_a_chunked_prefix_is_written_once_as_the_whole_gather():
     _drain(c)
     [(chash, names, data)] = c._store.saved
     assert c._store.marked == [chash] == [vc.prefix_hash(list(range(n)), prefix, [])]
+    assert c._store.rank == prefix, "ranked by the prefix's length in tokens"
     whole = vc._slot_mapping_for_blocks(list(range(-(-n // BLOCK))), BLOCK, prefix)
     for name, got in zip(names, data):
         want = vc._extract_layer(c._kv_caches[name], whole, False, BLOCK)
@@ -322,7 +324,7 @@ class _Batch:
     def __init__(self):
         self.kv = {}
 
-    def put_from(self, keys, views, ttl, region):
+    def put_from(self, keys, views, ttl, region, ranks=None):
         oks = []
         for k, v in zip(keys, views):
             ok = len(v) <= vc._MAX_VALUE_BYTES

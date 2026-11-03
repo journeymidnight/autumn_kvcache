@@ -126,13 +126,15 @@ class FakeStore:
 
     def __init__(self):
         self.data, self.put_bufs, self.get_bufs, self.regions = {}, [], [], []
+        self.ranks = {}  # key -> eviction rank of its last put
         self.exists_calls = self.head_calls = 0
 
-    def put_from(self, keys, bufs, ttl_secs=0, region=None):
+    def put_from(self, keys, bufs, ttl_secs=0, region=None, ranks=None):
         self.put_bufs += bufs
         self.regions.append(region)
-        for k, b in zip(keys, bufs):
+        for k, b, r in zip(keys, bufs, ranks or [0] * len(keys)):
             self.data[bytes(k)] = bytes(np.asarray(b))
+            self.ranks[bytes(k)] = r
         return [True] * len(keys)
 
     def get_into(self, keys, bufs, region=None):
@@ -263,6 +265,21 @@ def test_v2_transfers_land_in_the_named_pool():
         assert torch.equal(page_bytes(dst, s), page_bytes(src, s))
 
 
+@pytest.mark.parametrize("make,kind", POOLS)
+def test_a_page_is_ranked_by_its_position_in_its_prefix(make, kind):
+    # Every stored key of a page carries the page's position in tokens, from
+    # the pages sglang says come before the batch (`prefix_keys`).
+    store, pool = FakeStore(), make()
+    fill(pool, 7)
+    b = backend(store, pool)
+    info = types.SimpleNamespace(prefix_keys=["p0", "p1", "p2"])
+    assert all(b.batch_set_v1(HASHES, indices(STARTS), info))
+    codec = b._codec(pool)
+    for i, h in enumerate(HASHES):
+        for k in codec.keys(b._full_key(h)):
+            assert store.ranks[k] == (3 + i) * P, (h, k)
+
+
 class PoolName(str, Enum):  # as sglang's hicache_storage.PoolName
     KV = "kv"
     MAMBA = "mamba"
@@ -356,9 +373,9 @@ class RegionStore(FakeStore):
         super().__init__()
         self.calls = []
 
-    def put_from(self, keys, bufs, ttl_secs=0, region=None):
+    def put_from(self, keys, bufs, ttl_secs=0, region=None, ranks=None):
         self.calls.append(("put", list(bufs), region))
-        return super().put_from(keys, bufs, ttl_secs, region)
+        return super().put_from(keys, bufs, ttl_secs, region, ranks)
 
     def get_into(self, keys, bufs, region=None):
         self.calls.append(("get", list(bufs), region))

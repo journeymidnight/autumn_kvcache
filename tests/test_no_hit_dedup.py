@@ -48,7 +48,7 @@ class _FakeStore:
         self.probes += 1
         return self._present
 
-    def save_layers(self, chash: str, names, views, region=None) -> list:
+    def save_layers(self, chash: str, names, views, region=None, rank=0) -> list:
         if self._save_gate is not None:
             self._save_gate.wait()
         self.saved.append((chash, list(names)))

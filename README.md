@@ -55,6 +55,18 @@ come from memory. Pages held there are lost on a PS restart (a cache miss, then
 recompute). Measured with SGLang + Qwen3-VL-32B: per-request p50 1344 → 980 ms,
 2 GiB fetch 999 → 699 ms. See autumn-rs `docs/ops.md` ("Memory tier for KV cache").
 
+The tier evicts least recently used first, and among pages used at about the
+same time the deeper ones first, so a prefix loses its tail before its head
+(a hit is a run of pages from the start). The adapters pass each page's
+position in its prefix with the write (`evict_rank`, autumn wire 87): vLLM the
+prefix's length; sglang `(pages before the batch + page index) × page_size`.
+sglang tells the backend the pages before a batch only with
+`"hicache_storage_pass_prefix_keys": true` in
+`--hicache-storage-backend-extra-config`; set it. Without it every batch ranks
+from 0, and even with it a node written from the root over several 128-page
+batches gets an empty list after the first (sglang only extends a non-empty
+one): those batches rank from 0 too, which orders them by write time alone.
+
 The tier can evict a prefix's layers while its vLLM `__present__` marker stays.
 A load that then finds a layer missing injects nothing, and the connector
 deletes that marker (the worker its own rank's, the scheduler the one it

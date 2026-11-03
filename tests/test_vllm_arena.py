@@ -59,7 +59,7 @@ class _Store:
     def is_present(self, chash):
         return False
 
-    def save_layers(self, chash, names, views, region=None):
+    def save_layers(self, chash, names, views, region=None, rank=0):
         self.saved.append(([bytes(np.asarray(v)) for v in views], region, list(views)))
         return [True] * len(names)
 

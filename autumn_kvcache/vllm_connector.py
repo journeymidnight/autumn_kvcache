@@ -409,17 +409,22 @@ class _AutumnKVStore:
             at += c
         return out
 
-    def save_layers(self, content_hash: str, layer_names: List[str], views: List[Any], region=None) -> List[bool]:
+    def save_layers(
+        self, content_hash: str, layer_names: List[str], views: List[Any], region=None, rank: int = 0
+    ) -> List[bool]:
         """Batched zero-copy put of each layer's value, one bool per layer.
 
         `views` are 1-D byte views (numpy uint8 / torch uint8);
         len(views) == len(layer_names). Over UCX, views inside `region` (an
         `autumn.register` result) are sent from where they are; others are
-        copied through autumn's pool first.
+        copied through autumn's pool first. `rank`: the memory-tier eviction
+        rank of every value — the prefix's length in tokens, so a longer
+        prefix goes before a shorter one used at about the same time.
         """
         keys, pieces, counts = self._pieces(content_hash, layer_names, views)
         try:
-            return self._per_layer(list(self._batch.put_from(keys, pieces, self._layer_ttl, region)), counts)
+            ranks = [rank] * len(keys)
+            return self._per_layer(list(self._batch.put_from(keys, pieces, self._layer_ttl, region, ranks)), counts)
         except Exception as e:  # noqa: BLE001
             log.debug("save_layers put_from error (n=%d): %r", len(keys), e)
             return [False] * len(layer_names)
@@ -1180,7 +1185,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 torch.from_numpy(part).view(t.dtype).reshape(t.shape).copy_(t.detach())
             if not last:
                 return
-            oks = self._store.save_layers(job.content_hash, job.names, job.views, job.arena.region)
+            oks = self._store.save_layers(job.content_hash, job.names, job.views, job.arena.region, job.total)
             if oks and all(oks):
                 self._store.mark_present(job.content_hash)
             else:

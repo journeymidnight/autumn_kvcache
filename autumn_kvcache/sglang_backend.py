@@ -532,9 +532,13 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         found = iter(exists(flat) if exists else run(lambda: self._client.batch_head(flat)))
         return [all([next(found) for _ in ks]) for ks in page_keys]
 
-    def _put_pages(self, pool, base_keys, starts) -> List[bool]:
-        """Stores the pages not stored yet; True per page that is stored."""
+    def _put_pages(self, pool, base_keys, starts, first_page: int = 0) -> List[bool]:
+        """Stores the pages not stored yet; True per page that is stored.
+        `first_page`: the position of `base_keys[0]` in its prefix — each
+        page's memory-tier eviction rank is its position in tokens, so the
+        partition server drops a prefix's tail before its head."""
         codec = self._codec(pool)
+        page_tokens = int(getattr(pool, "page_size", 1) or 1)
         page_keys = [codec.keys(k) for k in base_keys]
         try:
             stored = self._present(page_keys)
@@ -545,20 +549,22 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         todo = [i for i, done in enumerate(stored) if not done]
         self._stats["set_skipped"] = self._stats.get("set_skipped", 0) + len(base_keys) - len(todo)
         if todo:
-            keys, bufs, owner = [], [], []
+            keys, bufs, owner, ranks = [], [], [], []
             if codec.kind == _PageCodec.COPY:
                 bufs = codec.copy_out(pool, [starts[i] for i in todo], self._scratch)
                 for i in todo:
                     keys += page_keys[i]
+                    ranks += [(first_page + i) * page_tokens] * len(page_keys[i])
                 owner = list(todo)
             else:
                 for i in todo:
                     segs = codec.segments(pool, starts[i])
                     keys += page_keys[i]
+                    ranks += [(first_page + i) * page_tokens] * len(page_keys[i])
                     bufs += segs
                     owner += [i] * len(segs)
             region = self._scratch_region() if codec.kind == _PageCodec.COPY else codec.region
-            ok = list(self._batch.put_from(keys, bufs, self._ttl_secs, region))
+            ok = list(self._batch.put_from(keys, bufs, self._ttl_secs, region, ranks))
             for i in todo:
                 stored[i] = True
             for i, good in zip(owner, ok):
@@ -615,10 +621,15 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         )
 
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
+        # The pages before these: sglang passes them when the storage config
+        # sets `hicache_storage_pass_prefix_keys` (an empty list from the root).
+        prefix_keys = getattr(extra_info, "prefix_keys", None)
+        # A list only: sglang's dataclass default is the tuple `(None,)`.
+        first_page = len(prefix_keys) if isinstance(prefix_keys, list) else 0
         return self._batch_v1(
             keys,
             host_indices,
-            self._put_pages,
+            lambda pool, full_keys, starts: self._put_pages(pool, full_keys, starts, first_page),
             "put_from",
             "set_error",
             lambda ok: "set_ok" if ok else "set_error",
