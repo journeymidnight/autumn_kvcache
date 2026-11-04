@@ -24,9 +24,11 @@ exact CPython — no abi3), so every consumer compiles it from that commit.
 There is **no daemon and no local DRAM cache** — the autumn partition layer is
 the only persistence path. KV pages are content-addressed
 (`kvc/{h}/{model_scope}/{pool}/{hash}/{layer}`, `h` = the hash's first hex
-char), so there is no invalidation. `h` comes first because autumn partitions
-kvc at `kvc/<hex>` when the cluster is bootstrapped (16 partitions by
-default): every model's pages spread over all of them with no per-model step.
+char), so there is no invalidation. The cluster serves them once the `kvc`
+namespace exists: `autumn-op namespace-create --name kvc --count 16` registers
+it and cuts it at `kvc/<hex>` (autumn-rs `cluster.sh` does this on its first
+start). `h` comes first so those 16 partitions take every model's pages with
+no per-model step.
 
 ## Install
 

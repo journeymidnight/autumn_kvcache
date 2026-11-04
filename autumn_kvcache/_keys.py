@@ -8,10 +8,11 @@ pages into the SAME autumn keyspace:
 
 - `kvc/`           — reserved namespace, distinguishes kvcache keys from
                      autumn-fuse / autumn-client keys on the shared cluster.
-- `h`              — the content hash's first hex char. autumn partitions kvc
-                     at `kvc/<hex>` (`autumn-op bootstrap --kvc-parts`), so
-                     putting it ahead of the model spreads every model's pages
-                     over all partitions with cuts made before any model runs.
+- `h`              — the content hash's first hex char. The kvc namespace is
+                     cut at `kvc/<hex>` when it is created (`autumn-op
+                     namespace-create --name kvc --count 16`), so putting it
+                     ahead of the model spreads every model's pages over all
+                     partitions with cuts made before any model runs.
 - `model_scope`    — `(model, model_fingerprint, tp_rank, tp_size, pp_rank,
                      pp_size)` scoping so two models / parallel ranks never
                      collide. The fingerprint (`_identity.py`) exists because
