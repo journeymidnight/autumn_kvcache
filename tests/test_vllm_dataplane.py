@@ -66,8 +66,9 @@ def main() -> int:
 
     # ── 2. key format ────────────────────────────────────────────────────────
     k = store._key("deadbeef", "layer.7")
-    # Relative: the client is bound to the `kvc` scope and prepends `kvc/`.
-    expected = f"{model_scope}/{VLLM_POOL_NAME}/{_KV_STORAGE_FORMAT}/deadbeef/layer.7".encode()
+    # Relative: the client is bound to the `kvc` scope and prepends `kvc/`;
+    # the hash bucket (its first char) leads.
+    expected = f"d/{model_scope}/{VLLM_POOL_NAME}/{_KV_STORAGE_FORMAT}/deadbeef/layer.7".encode()
     assert k == expected, f"key mismatch: {k!r} != {expected!r}"
     log.info("key format OK: %r", k)
 

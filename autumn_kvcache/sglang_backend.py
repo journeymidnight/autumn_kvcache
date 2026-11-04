@@ -30,7 +30,7 @@ import autumn
 
 from ._bridge import run, run_on, new_loop
 from ._identity import fingerprint_from_sources, read_credential_pair as _read_credential_pair
-from ._keys import build_model_scope, full_key, pool_prefix
+from ._keys import build_model_scope, full_key, pool_prefixes
 
 # The interface this adapter implements is sglang's, but sglang is not the only
 # engine that carries it: an engine may vendor the same module rather than
@@ -872,10 +872,10 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     def clear(self) -> None:
         # Pool-scoped: must NOT cross into the same model's vLLM (`vllm`) pool.
-        prefix = pool_prefix(self._model_scope, DEFAULT_POOL_NAME)
+        prefixes = pool_prefixes(self._model_scope, DEFAULT_POOL_NAME)
         try:
-            n = run(lambda: self._client.batch_delete(prefix))
-            log.info("AutumnKVCacheStorage.clear deleted %d keys under %r", n, prefix)
+            n = sum(run(lambda p=p: self._client.batch_delete(p)) for p in prefixes)
+            log.info("AutumnKVCacheStorage.clear deleted %d keys under */%s/%s/", n, self._model_scope, DEFAULT_POOL_NAME)
         except Exception as e:  # noqa: BLE001
             log.warning("clear() failed: %r", e)
 

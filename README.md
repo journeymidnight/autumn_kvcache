@@ -23,7 +23,10 @@ exact CPython — no abi3), so every consumer compiles it from that commit.
 
 There is **no daemon and no local DRAM cache** — the autumn partition layer is
 the only persistence path. KV pages are content-addressed
-(`kvc/{model_scope}/{pool}/{hash}/{layer}`), so there is no invalidation.
+(`kvc/{h}/{model_scope}/{pool}/{hash}/{layer}`, `h` = the hash's first hex
+char), so there is no invalidation. `h` comes first because autumn partitions
+kvc at `kvc/<hex>` when the cluster is bootstrapped (16 partitions by
+default): every model's pages spread over all of them with no per-model step.
 
 ## Install
 
@@ -199,8 +202,10 @@ path (don't do that — store new weights at a new path).
 > cost, whereas carrying KV across a layout-incompatible vLLM would be silent
 > garbage. Keys written by older connectors stay behind under the old model scope;
 > with `ttl_secs=0` they never expire, so reclaim them manually if you care
-> about the space: `client.batch_delete(b"kvc/<old-model-scope>/vllm/")` (the
-> old model scope is in the previous deployment's startup log).
+> about the space: `client.batch_delete(f"kvc/{h}/<old-model-scope>/vllm/".encode())`
+> for each `h` in `0123456789abcdef` (keys from before the hash-bucket layout:
+> the single prefix `kvc/<old-model-scope>/`; the old model scope is in the
+> previous deployment's startup log).
 
 **`ttl_secs`** (default `0` = no expiry) is the relative TTL after which an
 offloaded prefix stops being *served*. Content-addressed keys never invalidate,

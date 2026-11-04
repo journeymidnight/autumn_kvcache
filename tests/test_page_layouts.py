@@ -20,6 +20,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from autumn_kvcache.sglang_backend import AutumnKVCacheStorage, _PageCodec  # noqa: E402
+from autumn_kvcache._keys import full_key  # noqa: E402
 
 L, T, H, D, P = 3, 256, 2, 8, 16  # layers, tokens, kv heads, head dim, page size
 
@@ -160,6 +161,12 @@ class FakeStore:
     async def head(self, key):
         return bytes(key) in self.data
 
+    async def batch_delete(self, prefix):
+        gone = [k for k in self.data if k.startswith(bytes(prefix))]
+        for k in gone:
+            del self.data[k]
+        return len(gone)
+
 
 def backend(store, pool):
     b = object.__new__(AutumnKVCacheStorage)
@@ -227,7 +234,20 @@ def test_layouts_never_share_a_key():
         page_keys = b._codec(pool).keys(b._full_key(HASHES[0]))
         assert not keys & set(page_keys)
         keys |= set(page_keys)
-    assert b"m_0_1/kv/" + HASHES[0].encode() in keys, "layer_first must keep the keys written before"
+    assert b"0/m_0_1/kv/" + HASHES[0].encode() in keys, "layer_first stores a page under its base key"
+
+
+def test_pages_spread_over_hash_buckets_and_clear_reaches_every_bucket():
+    store = FakeStore()
+    b = backend(store, MHAPool("layer_first"))
+    buckets = "0123456789abcdef"
+    for c in buckets:
+        store.data[b._full_key(c * 64)] = b"kv"
+        store.data[full_key("m_0_1", c * 64, "vllm/v2", "/l0")] = b"vllm"
+    assert {k.split(b"/")[0] for k in store.data} == {c.encode() for c in buckets}
+    b.clear()
+    # Only the kv pool goes, from every bucket.
+    assert sorted(store.data.values()) == [b"vllm"] * 16
 
 
 @pytest.mark.parametrize("make,kind", POOLS)

@@ -18,7 +18,7 @@ Design (route A, mirrors vLLM's reference `SharedStorageConnector`):
   - scheduler role: prefix-hash lookup → autumn existence → matched-token count,
     then build per-request load/save metadata.
   - worker role: per-layer extract/inject of the paged KV tensor through autumn
-    keyed by `kvc/{model_scope}/vllm/{prefix_hash}/{layer_name}`.
+    keyed by `kvc/{h}/{model_scope}/vllm/{fmt}/{prefix_hash}/{layer_name}`.
 
 Phase 3a target = CPU-offload KV (no GPU staging buffers), synchronous load in
 `start_load_kv` (overlap is Phase 3b). The autumn-facing byte I/O is factored
@@ -254,8 +254,7 @@ class _AutumnKVStore:
     vLLM/torch dependency so `tests/test_vllm_dataplane.py` can exercise it
     against a real 1-node cluster.
 
-    Keys: `kvc/{model_scope}/vllm/{content_hash}/{layer_name}` (the `content_hash`
-    arg to `full_key` carries the `"{hash}/{layer}"` suffix).
+    Keys: `kvc/{h}/{model_scope}/vllm/{fmt}/{content_hash}/{layer_name}`.
     """
 
     def __init__(
@@ -347,11 +346,11 @@ class _AutumnKVStore:
         return self._marker_ttl
 
     def _key(self, content_hash: str, layer_name: str) -> bytes:
-        # kvc/{model}/{pool}/{fmt}/{hash}/{layer}.
         return full_key(
             self._model_scope,
-            f"{_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}",
-            VLLM_POOL_NAME,
+            content_hash,
+            f"{VLLM_POOL_NAME}/{_KV_STORAGE_FORMAT}",
+            f"/{layer_name}",
         )
 
     def exists(self, content_hash: str, layer_name: str) -> bool:

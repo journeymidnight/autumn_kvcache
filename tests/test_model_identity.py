@@ -286,12 +286,11 @@ def test_full_key_layout_with_fingerprint():
     cfg = model_scope_cfg_from_vllm(fake_vllm_config(FakeModelConfig(**QWEN_32B),
                                                      weights_path="models/qwen32b"))
     model = build_model_scope(cfg, cfg.model_fingerprint)
-    # (Prepend-only): full_key is RELATIVE to the
-    # client's `kvc` binding scope — the builder emits {model}/{pool}/{hash} and
-    # the ClusterClient prepends `kvc/` (scope locked by construction).
-    key = full_key(model, "v1/deadbeef/model.layers.0", "vllm")
-    assert key.startswith(b"qwen32b_")  # relative: model segment = weights-path basename
-    assert key.endswith(b"/vllm/v1/deadbeef/model.layers.0")
+    # full_key is RELATIVE to the client's `kvc` binding scope: the hash
+    # bucket, then the model, pool and hash; the ClusterClient prepends `kvc/`.
+    key = full_key(model, "deadbeef", "vllm/v2", "/model.layers.0")
+    assert key.startswith(b"d/qwen32b_")  # bucket = hash's first char; model = weights-path basename
+    assert key.endswith(b"/vllm/v2/deadbeef/model.layers.0")
     # No namespace prefix in the relative key — the binding owns it.
     assert not key.startswith(b"kvc/")
 
@@ -360,7 +359,7 @@ def test_version_only_config_still_unfingerprintable(monkeypatch):
 
 def test_kv_layout_version_splits_model_scope(monkeypatch):
     a = _model_scope(_mk7b())
-    monkeypatch.setattr(_identity, "VLLM_KV_STORAGE_FORMAT", "v2")
+    monkeypatch.setattr(_identity, "VLLM_KV_STORAGE_FORMAT", "v3")
     assert _model_scope(_mk7b()) != a
 
 
@@ -369,9 +368,9 @@ def test_kv_layout_version_pinned_and_in_sources():
     vLLM-pool key path AND the model fingerprint. Bump it DELIBERATELY —
     together with an `_extract_layer`/`_inject_layer` layout change — never
     accidentally: any change cold-invalidates the whole vLLM pool."""
-    assert VLLM_KV_STORAGE_FORMAT == "v1"
+    assert VLLM_KV_STORAGE_FORMAT == "v2"
     src = vllm_identity_sources(_mk7b())
-    assert src["kv_layout"] == "v1"
+    assert src["kv_layout"] == "v2"
 
 
 # ── KV-cache dtype: the "same model, different element type" axis ───────────

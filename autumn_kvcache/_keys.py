@@ -4,10 +4,14 @@ Both the sglang HiCache L3 backend (`sglang_backend.py`) and the vLLM
 `KVConnectorV1` adapter (`vllm_connector.py`) map an inference engine's KV
 pages into the SAME autumn keyspace:
 
-    kvc/{model_scope}/{pool}/{content_hash}
+    kvc/{h}/{model_scope}/{pool}/{content_hash}
 
 - `kvc/`           — reserved namespace, distinguishes kvcache keys from
                      autumn-fuse / autumn-client keys on the shared cluster.
+- `h`              — the content hash's first hex char. autumn partitions kvc
+                     at `kvc/<hex>` (`autumn-op bootstrap --kvc-parts`), so
+                     putting it ahead of the model spreads every model's pages
+                     over all partitions with cuts made before any model runs.
 - `model_scope`    — `(model, model_fingerprint, tp_rank, tp_size, pp_rank,
                      pp_size)` scoping so two models / parallel ranks never
                      collide. The fingerprint (`_identity.py`) exists because
@@ -25,7 +29,7 @@ from __future__ import annotations
 KEY_NAMESPACE = "kvc"
 
 # The vLLM connector's OWN storage-format / KV-layout version. It is baked
-# into every vLLM-pool key (`kvc/{model_scope}/vllm/{THIS}/{hash}/{layer}`, see
+# into every vLLM-pool key (`kvc/{h}/{model_scope}/vllm/{THIS}/{hash}/{layer}`, see
 # `_AutumnKVStore._key`) AND folded into the model fingerprint
 # (`_identity.vllm_identity_sources`), so bumping it makes every old entry
 # unreachable twice over — old bytes can NEVER be loaded by an incompatible
@@ -45,7 +49,10 @@ KEY_NAMESPACE = "kvc"
 #
 # Lives here (not in `vllm_connector.py`, which imports the `autumn` native
 # module at top level) so the pure offline unit tests can import it.
-VLLM_KV_STORAGE_FORMAT = "v1"
+VLLM_KV_STORAGE_FORMAT = "v2"
+
+# The hash buckets: sha256 hexdigest chars, the first char of every content hash.
+HASH_BUCKETS = "0123456789abcdef"
 
 
 def _rank_int(cfg, attr: str, default: int) -> int:
@@ -115,26 +122,23 @@ def build_model_scope(cfg, model_fingerprint=None) -> str:
     return "_".join(parts)
 
 
-def full_key(model: str, content_hash: str, pool: str) -> bytes:
+def full_key(model: str, content_hash: str, pool: str, tail: str = "") -> bytes:
     """Compose the stored partition key (utf-8 bytes), RELATIVE to the client's
-    ``kvc`` binding scope.
+    ``kvc`` binding scope: ``{h}/{model}/{pool}/{content_hash}{tail}``, ``h``
+    the hash's first char.
 
-    Under Option 3 (Prepend-only) the ``BatchClient`` is bound
-    to ``scope="kvc"`` and PREPENDS ``kvc/`` itself, so scope is locked by
-    construction and the builder must emit only the RELATIVE part →
-    ``{model}/{pool}/{content_hash}`` (the full wire key becomes
-    ``kvc/{model}/{pool}/{content_hash}``). ``model`` is the per-model instance
-    scope (arch + weights fingerprint + tp/pp — what ``build_model_scope``
-    returns).
+    The ``BatchClient`` is bound to ``scope="kvc"`` and PREPENDS ``kvc/``
+    itself, so the builder emits only the relative part. ``model`` is the
+    per-model instance scope (what ``build_model_scope`` returns).
     """
-    return f"{model}/{pool}/{content_hash}".encode("utf-8")
+    return f"{content_hash[0]}/{model}/{pool}/{content_hash}{tail}".encode("utf-8")
 
 
-def pool_prefix(model: str, pool: str) -> bytes:
-    """Prefix covering one model's keys within a single pool, RELATIVE to
-    ``kvc`` (see `full_key`).
+def pool_prefixes(model: str, pool: str) -> list:
+    """Prefixes covering one model's keys within a single pool, one per hash
+    bucket, RELATIVE to ``kvc`` (see `full_key`).
 
-    `AutumnKVCacheStorage.clear()` (sglang) must use this so a debug clear of
+    `AutumnKVCacheStorage.clear()` (sglang) must use these so a debug clear of
     the `kv` pool does not also wipe the same model's `vllm` pool.
     """
-    return f"{model}/{pool}/".encode("utf-8")
+    return [f"{h}/{model}/{pool}/".encode("utf-8") for h in HASH_BUCKETS]
