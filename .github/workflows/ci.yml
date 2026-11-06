@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline-tests:
+    # No cluster, no engine, no native `autumn` module: the key / model-scope
+    # logic and the interface resolution. The sglang backend imports numpy.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e . numpy pytest
+      - run: python -m pytest tests/test_model_identity.py tests/test_iface_resolution.py -q
+      # The adapter modules themselves need the native `autumn` extension,
+      # which is built from autumn-rs; only the pure parts are importable here.
+      - run: python -c "import autumn_kvcache, autumn_kvcache._identity, autumn_kvcache._keys"
