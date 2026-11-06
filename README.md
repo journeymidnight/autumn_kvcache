@@ -17,9 +17,12 @@ client, and a client/cluster mismatch does **not** fail the handshake — it can
 decode garbage. FreeToken's `docker/Dockerfile.freetoken-l3` carries the same
 pin as `AUTUMN_IMAGE_PIN` for exactly this reason.
 
-The PyO3 extension (`import autumn`) is built from autumn-rs and is NOT
-installable as a portable wheel (native ext, bound to the builder's glibc and
-exact CPython — no abi3), so every consumer compiles it from that commit.
+The PyO3 extension (`import autumn`) is built from autumn-rs at that commit.
+Built with `--features abi3` it is one wheel for every CPython >= 3.11 (the
+buffer protocol the zero-copy reads use entered the limited API there); without
+it the wheel is bound to the interpreter it was built with. Either way it is a
+native extension tied to the builder's glibc, so a published wheel has to be a
+manylinux one.
 
 There is **no daemon and no local DRAM cache** — the autumn partition layer is
 the only persistence path. KV pages are content-addressed
@@ -35,16 +38,18 @@ no per-model step.
 The native `autumn` PyO3 extension must be on the same interpreter:
 
 ```bash
-# 1) build + install the native autumn client into your venv
-cd python
+# 1) build + install the native autumn client into your venv (autumn-rs checkout)
+cd autumn-rs/python
 maturin build --release --interpreter /path/to/venv/bin/python
+#    add `--features abi3` for one wheel that serves every CPython >= 3.11
 #    for UCX: add `--features ucx --auditwheel skip` — the wheel must link the
 #    system UCX; auditwheel's bundled copy has no mlx5 transport modules, and
 #    the client then cannot connect over RDMA
 /path/to/venv/bin/pip install --force-reinstall target/wheels/autumn-*.whl
 
-# 2) install this package (pure-python) — still in python/ from step 1
-/path/to/venv/bin/pip install -e autumn_kvcache
+# 2) install this package (pure Python), from this repo's root or straight from git
+/path/to/venv/bin/pip install -e .
+/path/to/venv/bin/pip install "git+https://github.com/journeymidnight/autumn_kvcache@<rev>"
 ```
 
 Both adapter modules import **without** the engine (sglang / vLLM) installed —
