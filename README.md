@@ -17,12 +17,10 @@ client, and a client/cluster mismatch does **not** fail the handshake — it can
 decode garbage. FreeToken's `docker/Dockerfile.freetoken-l3` carries the same
 pin as `AUTUMN_IMAGE_PIN` for exactly this reason.
 
-The PyO3 extension (`import autumn`) is built from autumn-rs at that commit.
-Built with `--features abi3` it is one wheel for every CPython >= 3.11 (the
-buffer protocol the zero-copy reads use entered the limited API there); without
-it the wheel is bound to the interpreter it was built with. Either way it is a
-native extension tied to the builder's glibc, so a published wheel has to be a
-manylinux one.
+The PyO3 extension (`import autumn`) is the `autumn-rs` distribution on PyPI:
+one manylinux abi3 wheel per architecture for every CPython >= 3.11. Its
+version must match the cluster's autumn-rs release; for a cluster built from
+another commit, build the extension from that commit (below).
 
 There is **no daemon and no local DRAM cache** — the autumn partition layer is
 the only persistence path. KV pages are content-addressed
@@ -35,21 +33,21 @@ no per-model step.
 
 ## Install
 
-The native `autumn` PyO3 extension must be on the same interpreter:
+```bash
+pip install autumn-kvcache          # pulls autumn-rs, the native `autumn` client
+pip install "git+https://github.com/journeymidnight/autumn_kvcache@<rev>"   # or from git
+```
+
+The native client from source, for a cluster at another commit or for RDMA
+(an autumn-rs checkout at that commit):
 
 ```bash
-# 1) build + install the native autumn client into your venv (autumn-rs checkout)
 cd autumn-rs/python
 maturin build --release --interpreter /path/to/venv/bin/python
-#    add `--features abi3` for one wheel that serves every CPython >= 3.11
-#    for UCX: add `--features ucx --auditwheel skip` — the wheel must link the
-#    system UCX; auditwheel's bundled copy has no mlx5 transport modules, and
-#    the client then cannot connect over RDMA
-/path/to/venv/bin/pip install --force-reinstall target/wheels/autumn-*.whl
-
-# 2) install this package (pure Python), from this repo's root or straight from git
-/path/to/venv/bin/pip install -e .
-/path/to/venv/bin/pip install "git+https://github.com/journeymidnight/autumn_kvcache@<rev>"
+#    for UCX: add `--features ucx --auditwheel skip`; the wheel must link the
+#    system UCX, since auditwheel's bundled copy has no mlx5 transport modules
+#    and the client then cannot connect over RDMA
+/path/to/venv/bin/pip install --force-reinstall target/wheels/autumn_rs-*.whl
 ```
 
 Both adapter modules import **without** the engine (sglang / vLLM) installed —

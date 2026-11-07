@@ -8,7 +8,7 @@ run in an isolated venv.
 
 Setup before running:
     cd python && maturin develop --release         # builds the `autumn` module
-    pip install -e python/autumn_kvcache           # installs this package
+    pip install -e .           # installs this package
     ./cluster.sh reset 1                           # start a 1-node cluster
     AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 python -m autumn_kvcache.tests.test_vllm_dataplane
 
