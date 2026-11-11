@@ -84,6 +84,32 @@ probes), so the next request for the prefix saves it again. Run vLLM with
 `kv_load_failure_policy="recompute"`: under the default `"fail"` the request
 whose load failed ends with an error instead of being recomputed.
 
+## Using autumn-kvcache as an SGLang HiCache L3
+
+`AutumnKVCacheStorage` is loaded through HiCache's dynamic storage backend.
+`page_first_direct` lets it send and receive pages straight from SGLang's host
+memory; set `transport` to `"ucx"` for RDMA.
+
+```bash
+python -m sglang.launch_server --model-path <model> \
+  --enable-hierarchical-cache \
+  --hicache-mem-layout page_first_direct \
+  --hicache-write-policy write_through \
+  --hicache-storage-prefetch-policy wait_complete \
+  --hicache-storage-backend dynamic \
+  --hicache-storage-backend-extra-config '{
+    "backend_name": "autumn",
+    "module_path": "autumn_kvcache.sglang_backend",
+    "class_name": "AutumnKVCacheStorage",
+    "interface_v1": 1,
+    "endpoint": "<manager>:9001",
+    "transport": "tcp",
+    "hicache_storage_pass_prefix_keys": true
+  }'
+```
+
+The other keys are under "Architecture notes" below.
+
 ## Using autumn-kvcache as a vLLM L3 (cross-instance prefix cache)
 
 `AutumnKVConnector` is a native vLLM V1 KV connector (Phase 3a — CPU-offload
