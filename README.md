@@ -18,9 +18,10 @@ decode garbage. FreeToken's `docker/Dockerfile.freetoken-l3` carries the same
 pin as `AUTUMN_IMAGE_PIN` for exactly this reason.
 
 The PyO3 extension (`import autumn`) is the `autumn-rs` distribution on PyPI:
-one manylinux abi3 wheel per architecture for every CPython >= 3.11. Its
-version must match the cluster's autumn-rs release; for a cluster built from
-another commit, build the extension from that commit (below).
+one manylinux abi3 wheel per architecture for every CPython >= 3.11. It must
+speak the cluster's wire version; each autumn-rs release note says which
+wheel it works with (0.1.1 works with the 0.1.0 wheel). For a cluster built
+from another commit, build the extension from that commit (below).
 
 There is **no daemon and no local DRAM cache** — the autumn partition layer is
 the only persistence path. KV pages are content-addressed
@@ -58,9 +59,10 @@ the data-plane smoke test regardless.
 ## Faster reads: the partition server's memory tier
 
 Start the partition servers with `--mem-tier-bytes <budget> --mem-tier-prefix kvc/`
-and KV pages are held in their DRAM and acknowledged without a log write; reads
-come from memory. Pages held there are lost on a PS restart (a cache miss, then
-recompute). Measured with SGLang + Qwen3-VL-32B: per-request p50 1344 → 980 ms,
+and KV pages are acknowledged from their DRAM and written to disk right after
+(three replicas); reads come from memory. A PS crash loses only the pages that
+had not reached disk yet, at most the tier's budget (a cache miss, then
+recompute); a page on disk outlives eviction and restarts. Measured with SGLang + Qwen3-VL-32B: per-request p50 1344 → 980 ms,
 2 GiB fetch 999 → 699 ms. See autumn-rs `docs/ops.md` ("Memory tier for KV cache").
 
 The tier evicts least recently used first, and among pages used at about the
@@ -75,7 +77,8 @@ from 0, and even with it a node written from the root over several 128-page
 batches gets an empty list after the first (sglang only extends a non-empty
 one): those batches rank from 0 too, which orders them by write time alone.
 
-The tier can evict a prefix's layers while its vLLM `__present__` marker stays.
+A prefix's layer can be gone while its vLLM `__present__` marker stays, for
+example when a partition server crashed before the layer reached disk.
 A load that then finds a layer missing injects nothing, and the connector
 deletes that marker (the worker its own rank's, the scheduler the one it
 probes), so the next request for the prefix saves it again. Run vLLM with
