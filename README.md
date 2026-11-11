@@ -20,8 +20,10 @@ pin as `AUTUMN_IMAGE_PIN` for exactly this reason.
 The PyO3 extension (`import autumn`) is the `autumn-rs` distribution on PyPI:
 one manylinux abi3 wheel per architecture for every CPython >= 3.11. It must
 speak the cluster's wire version; each autumn-rs release note says which
-wheel it works with (0.1.1 works with the 0.1.0 wheel). For a cluster built
-from another commit, build the extension from that commit (below).
+wheel it works with (0.1.2: the 0.1.2 wheel). The wheel speaks TCP, and UCX
+through the host's library (>= 1.17, `libucp.so.0` on the loader path). For a
+cluster built from another commit, build the extension from that commit
+(below).
 
 There is **no daemon and no local DRAM cache** — the autumn partition layer is
 the only persistence path. KV pages are content-addressed
@@ -39,15 +41,12 @@ pip install autumn-kvcache          # pulls autumn-rs, the native `autumn` clien
 pip install "git+https://github.com/journeymidnight/autumn_kvcache@<rev>"   # or from git
 ```
 
-The native client from source, for a cluster at another commit or for RDMA
-(an autumn-rs checkout at that commit):
+The native client from source, for a cluster at another commit (an autumn-rs
+checkout at that commit):
 
 ```bash
 cd autumn-rs/python
-maturin build --release --interpreter /path/to/venv/bin/python
-#    for UCX: add `--features ucx --auditwheel skip`; the wheel must link the
-#    system UCX, since auditwheel's bundled copy has no mlx5 transport modules
-#    and the client then cannot connect over RDMA
+maturin build --release --features ucx --interpreter /path/to/venv/bin/python
 /path/to/venv/bin/pip install --force-reinstall target/wheels/autumn_rs-*.whl
 ```
 

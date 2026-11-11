@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autumn-kvcache"
-version = "0.1.0"
+version = "0.1.1"
 description = "sglang HiCache L3 and vLLM KV-connector backends on autumn-rs"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -13,7 +13,7 @@ authors = [{ name = "autumn-rs contributors" }]
 dependencies = [
   # The native client, `import autumn`. Pinned: it must be the release that
   # matches AUTUMN_REV (see README, "Which autumn-rs this tracks").
-  "autumn-rs==0.1.0",
+  "autumn-rs==0.1.2",
   "numpy",
 ]
 
