@@ -132,6 +132,7 @@ KVCFG='{
   "kv_connector":"AutumnKVConnector",
   "kv_connector_module_path":"autumn_kvcache.vllm_connector",
   "kv_role":"kv_both",
+  "kv_load_failure_policy":"recompute",
   "kv_connector_extra_config":{"endpoint":"127.0.0.1:9001","transport":"tcp"}
 }'
 
